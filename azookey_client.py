@@ -86,6 +86,12 @@ def _ensure_engine_settings(
                             existing = loaded
                     except (ValueError, TypeError):
                         existing = None
+                    if existing is None:
+                        try:
+                            backup = settings_file.with_name(f"{settings_file.name}.corrupt.{time.time_ns()}")
+                            os.replace(settings_file, backup)
+                        except OSError:
+                            pass
                 payload = dict(DEFAULT_ENGINE_SETTINGS)
                 zenzai_cfg = dict(DEFAULT_ENGINE_SETTINGS["zenzai"])
                 if existing is not None:
@@ -146,6 +152,9 @@ class _NativeSuggestion(ctypes.Structure):
 
 _CUDA_DRIVER_DLL = "nvcuda.dll"
 _CUDA_RUNTIME_DLLS = ("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll")
+_CUDA_PROBE_TTL = 5.0
+_CUDA_PROBE_LOCK = threading.Lock()
+_CUDA_PROBE_CACHE: dict[str, tuple[float, bool, str]] = {}
 _VULKAN_LOADER_DLL = "vulkan-1.dll"
 _VULKAN_PROBE_TTL = 5.0
 _VULKAN_PROBE_LOCK = threading.Lock()
@@ -231,6 +240,55 @@ def _probe_vulkan_device(vulkan_dir: Path, *, use_system_loader: bool = False) -
 
     with _VULKAN_PROBE_LOCK:
         _VULKAN_PROBE_CACHE[cache_key] = (time.monotonic(), result[0], result[1])
+    return result
+
+
+def _probe_cuda_device(driver_dir: Path | None = None) -> tuple[bool, str]:
+    """Verify via nvcuda.dll that at least one usable CUDA GPU device exists."""
+    cache_key = os.path.normcase(str(driver_dir)) if driver_dir is not None else "<system>"
+    now = time.monotonic()
+    with _CUDA_PROBE_LOCK:
+        cached = _CUDA_PROBE_CACHE.get(cache_key)
+        if cached is not None and now - cached[0] < _CUDA_PROBE_TTL:
+            return cached[1], cached[2]
+
+    dll_dir_handle = None
+    cuda = None
+    result: tuple[bool, str]
+    try:
+        if driver_dir is not None:
+            dll_dir_handle = os.add_dll_directory(str(driver_dir))
+            cuda = ctypes.WinDLL(str(driver_dir / _CUDA_DRIVER_DLL))
+        else:
+            cuda = ctypes.WinDLL(_CUDA_DRIVER_DLL)
+        cuda.cuInit.argtypes = [ctypes.c_uint]
+        cuda.cuInit.restype = ctypes.c_int
+        cuda.cuDeviceGetCount.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        cuda.cuDeviceGetCount.restype = ctypes.c_int
+
+        rc = int(cuda.cuInit(0))
+        if rc != 0:
+            result = (False, f"CUDA ドライバを初期化できませんでした (cuInit={rc})。")
+        else:
+            device_count = ctypes.c_int(0)
+            rc_count = int(cuda.cuDeviceGetCount(ctypes.byref(device_count)))
+            if rc_count != 0 or device_count.value <= 0:
+                result = (False, "利用可能な NVIDIA CUDA GPU デバイスが見つかりません。")
+            else:
+                result = (True, "")
+    except (OSError, AttributeError, ValueError, ctypes.ArgumentError):
+        result = (False, f"{_CUDA_DRIVER_DLL} を初期化できないため、CUDA GPU を利用できません。")
+    finally:
+        if cuda is not None and driver_dir is not None:
+            _try_free_library(cuda)
+        if dll_dir_handle is not None:
+            try:
+                dll_dir_handle.close()
+            except Exception:
+                pass
+
+    with _CUDA_PROBE_LOCK:
+        _CUDA_PROBE_CACHE[cache_key] = (time.monotonic(), result[0], result[1])
     return result
 
 
@@ -546,6 +604,17 @@ def diagnose_backend(engine_dir: str | Path, backend: str) -> BackendDiagnostic:
             reason=reason,
         )
 
+    cuda_ok, cuda_reason = _probe_cuda_device(driver_extra_dir)
+    if not cuda_ok:
+        return BackendDiagnostic(
+            backend="cuda",
+            ready=False,
+            has_nvidia_driver=True,
+            missing_files=(),
+            extra_dll_dirs=tuple(extra_dirs),
+            reason=cuda_reason,
+        )
+
     return BackendDiagnostic(
         backend="cuda",
         ready=True,
@@ -608,6 +677,17 @@ class AzooKeyRuntime:
             if self._library is not None:
                 if folder != self._folder:
                     raise RuntimeError("変換エンジンの場所を変更するには、アプリを再起動してください。")
+                if not self._dll_directory_handles:
+                    active_dir = folder / f"llama_{self.active_backend}"
+                    active_diag = diagnose_backend(folder, self.active_backend)
+                    re_dirs = _dedupe_existing_dirs([active_dir, *active_diag.extra_dll_dirs, folder])
+                    re_handles = []
+                    try:
+                        for path in re_dirs:
+                            re_handles.append(os.add_dll_directory(str(path)))
+                        self._dll_directory_handles = re_handles
+                    except OSError:
+                        self._close_dll_handles(re_handles)
                 if backend != self.active_backend:
                     diag = diagnose_backend(folder, backend)
                     self.fallback_reason = (

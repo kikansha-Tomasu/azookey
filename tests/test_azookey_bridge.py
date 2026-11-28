@@ -32,6 +32,11 @@ class TextConversionTests(unittest.TestCase):
         self.assertEqual(app._normalized_kana_prefix("あいn"), "あいん")
         self.assertEqual(app._normalized_kana_prefix("あいk"), "あい")
 
+    def test_sanitize_zenzai_profile_strips_controls_and_truncates(self) -> None:
+        self.assertEqual(app._sanitize_zenzai_profile("  dev\n\t\x00user  "), "devuser")
+        long_profile = "a" * 300
+        self.assertEqual(len(app._sanitize_zenzai_profile(long_profile)), app._ZENZAI_PROFILE_MAX_LEN)
+
 
 class StorageTests(unittest.TestCase):
     def test_atomic_json_and_corrupt_backup(self) -> None:
@@ -268,6 +273,53 @@ class AzooKeyClientTests(unittest.TestCase):
             self.assertEqual(saved["zenzai"]["profile"], "dev")
             self.assertEqual(saved["zenzai"]["backend"], "vulkan")
 
+    def test_ensure_engine_settings_backs_up_corrupt_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            appdata = Path(tmp) / "appdata"
+            engine_dir = Path(tmp) / "engine"
+            engine_dir.mkdir()
+            existing = appdata / "Azookey" / "settings.json"
+            existing.parent.mkdir(parents=True)
+            existing.write_text("{corrupt", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"APPDATA": str(appdata)}):
+                azookey_client._ensure_engine_settings(engine_dir, use_zenzai=False)
+            backups = list(existing.parent.glob("settings.json.corrupt.*"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_text(encoding="utf-8"), "{corrupt")
+
+    def test_probe_cuda_device_handles_success_zero_devices_and_init_error(self) -> None:
+        def _make_fake_cuda(init_rc: int, count_rc: int, dev_count: int):
+            def _cu_get_count(out_ptr):
+                out_ptr._obj.value = dev_count
+                return count_rc
+
+            fake = mock.Mock()
+            fake.cuInit = mock.Mock(return_value=init_rc)
+            fake.cuDeviceGetCount = mock.Mock(side_effect=_cu_get_count)
+            return fake
+
+        with azookey_client._CUDA_PROBE_LOCK:
+            azookey_client._CUDA_PROBE_CACHE.clear()
+        with mock.patch.object(ctypes, "WinDLL", return_value=_make_fake_cuda(0, 0, 1)):
+            ok, reason = azookey_client._probe_cuda_device()
+            self.assertTrue(ok, reason)
+            self.assertEqual(reason, "")
+
+        with azookey_client._CUDA_PROBE_LOCK:
+            azookey_client._CUDA_PROBE_CACHE.clear()
+        with mock.patch.object(ctypes, "WinDLL", return_value=_make_fake_cuda(0, 0, 0)):
+            ok, reason = azookey_client._probe_cuda_device()
+            self.assertFalse(ok)
+            self.assertIn("CUDA", reason)
+
+        with azookey_client._CUDA_PROBE_LOCK:
+            azookey_client._CUDA_PROBE_CACHE.clear()
+        with mock.patch.object(ctypes, "WinDLL", return_value=_make_fake_cuda(100, 0, 1)):
+            ok, reason = azookey_client._probe_cuda_device()
+            self.assertFalse(ok)
+            self.assertIn("cuInit=100", reason)
+
     def test_diagnose_backend_reports_missing_engine_dir(self) -> None:
         diag = azookey_client.diagnose_backend("", "cpu")
         self.assertFalse(diag.ready)
@@ -292,6 +344,8 @@ class WindowsInputTests(unittest.TestCase):
         self.assertEqual(windows_input._split_grapheme_clusters("👨‍👩‍👧‍👦"), ["👨‍👩‍👧‍👦"])
         self.assertEqual(windows_input._split_grapheme_clusters("🇯🇵a"), ["🇯🇵", "a"])
         self.assertEqual(windows_input._split_grapheme_clusters("か\u3099き"), ["か\u3099", "き"])
+        # Non-emoji text separated by ZWJ should not swallow the following normal character.
+        self.assertEqual(windows_input._split_grapheme_clusters("あ\u200dい"), ["あ", "\u200d", "い"])
 
     def test_replace_unicode_text_counts_grapheme_clusters_for_backspaces(self) -> None:
         with (
@@ -299,8 +353,8 @@ class WindowsInputTests(unittest.TestCase):
             mock.patch.object(windows_input, "send_unicode_text") as send_mock,
         ):
             windows_input.replace_unicode_text("家族👨‍👩‍👧‍👦", "家族😊")
-            bs_mock.assert_called_once_with(1)
-            send_mock.assert_called_once_with("😊")
+            bs_mock.assert_called_once_with(1, target_hwnd=0)
+            send_mock.assert_called_once_with("😊", target_hwnd=0)
 
     def test_sync_unicode_text_uses_grapheme_clusters_for_delete_and_cursor(self) -> None:
         with (
@@ -308,7 +362,33 @@ class WindowsInputTests(unittest.TestCase):
             mock.patch.object(windows_input, "send_virtual_keys") as vk_mock,
         ):
             windows_input.sync_unicode_text("あ👨‍👩‍👧‍👦い", -8, "あい", -1)
-            vk_mock.assert_called_once_with(windows_input.VK_DELETE, 1)
+            vk_mock.assert_called_once_with(windows_input.VK_DELETE, 1, target_hwnd=0)
+
+    def test_send_unicode_text_aborts_when_foreground_window_changes(self) -> None:
+        fg_sequence = iter([100, 999])
+        with (
+            mock.patch.object(windows_input, "foreground_window", side_effect=lambda: next(fg_sequence)),
+            mock.patch.object(windows_input, "_send_inputs") as send_mock,
+            mock.patch.object(windows_input.time, "sleep"),
+        ):
+            windows_input.send_unicode_text("ab", target_hwnd=100)
+            self.assertEqual(send_mock.call_count, 1)
+
+    def test_ensure_modifiers_released_releases_held_ctrl(self) -> None:
+        def _fake_key_state(vk: int) -> int:
+            return 0x8000 if vk == windows_input.VK_LCONTROL else 0
+
+        with (
+            mock.patch.object(windows_input.user32, "GetAsyncKeyState", side_effect=_fake_key_state),
+            mock.patch.object(windows_input, "_send_inputs") as send_mock,
+            mock.patch.object(windows_input.time, "sleep"),
+        ):
+            windows_input._ensure_modifiers_released()
+            send_mock.assert_called_once()
+            sent_inputs = send_mock.call_args[0][0]
+            self.assertEqual(len(sent_inputs), 1)
+            self.assertEqual(sent_inputs[0].ki.wVk, windows_input.VK_LCONTROL)
+            self.assertTrue(sent_inputs[0].ki.dwFlags & windows_input.KEYEVENTF_KEYUP)
 
     def test_set_active_false_does_not_drop_in_flight_swallowed_keyup(self) -> None:
         hook = windows_input.KeyboardHook(queue.Queue())

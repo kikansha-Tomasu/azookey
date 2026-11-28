@@ -20,14 +20,14 @@ if exist ".venv\Scripts\python.exe" (
   goto :done
 )
 
-where pythonw >nul 2>&1
+rem Verify a real Python interpreter exists (avoid Windows Store empty alias stubs).
+python --version >nul 2>&1
 if not errorlevel 1 (
-  start "" pythonw app.py %*
-  goto :done
-)
-
-where python >nul 2>&1
-if not errorlevel 1 (
+  where pythonw >nul 2>&1
+  if not errorlevel 1 (
+    start "" pythonw app.py %*
+    goto :done
+  )
   python app.py %*
   set "EXIT_CODE=%errorlevel%"
   popd

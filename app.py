@@ -360,6 +360,15 @@ def _settings_path() -> Path:
     return chosen / "AzooKeyLiveBridge" / "settings.json"
 
 
+_ZENZAI_PROFILE_MAX_LEN = 200
+
+
+def _sanitize_zenzai_profile(raw: object) -> str:
+    text = str(raw or "")
+    cleaned = "".join(ch for ch in text if ch.isprintable() and ch not in "\r\n\t\x00")
+    return cleaned.strip()[:_ZENZAI_PROFILE_MAX_LEN]
+
+
 def _load_settings() -> dict[str, str]:
     with _SETTINGS_IO_LOCK:
         data = _read_json_dict_safe(_settings_path())
@@ -377,7 +386,7 @@ def _load_settings() -> dict[str, str]:
     minimize_to_tray = "0" if str(data.get("minimize_to_tray", "1")) == "0" else "1"
     start_minimized = "1" if str(data.get("start_minimized", "0")) == "1" else "0"
     use_zenzai = "0" if str(data.get("use_zenzai", "1")) == "0" else "1"
-    zenzai_profile = str(data.get("zenzai_profile", ""))
+    zenzai_profile = _sanitize_zenzai_profile(data.get("zenzai_profile", ""))
     zenzai_backend = str(data.get("zenzai_backend", "cpu")).lower()
     if zenzai_backend not in VALID_BACKENDS:
         zenzai_backend = "cpu"
@@ -1059,6 +1068,7 @@ class CompositionWorker:
                 self._displayed_cursor,
                 new_text,
                 clamped_cursor,
+                target_hwnd=hwnd,
             )
         self._displayed_text = new_text
         self._displayed_cursor = clamped_cursor
@@ -1193,7 +1203,7 @@ class CompositionWorker:
                 self._max_seq = event.seq
         if event.kind == "english":
             if foreground_window() == event.hwnd:
-                send_unicode_text(event.char)
+                send_unicode_text(event.char, target_hwnd=event.hwnd)
             return
         if event.kind == "clear_context":
             self._clear_context()
@@ -1994,6 +2004,44 @@ class CandidatePopup:
         self.panel.pack(fill="both", expand=True)
         self.window.bind("<MouseWheel>", self._on_mouse_wheel)
         self.panel.bind("<MouseWheel>", self._on_mouse_wheel)
+
+        # Pre-allocate header, divider, and fixed candidate slots to avoid
+        # destroying/recreating Tk widgets on every keystroke.
+        self._header_label = tk.Label(
+            self.panel,
+            text="",
+            anchor="w",
+            justify="left",
+            bg=theme["header_bg"],
+            fg=theme["header_fg"],
+        )
+        self._header_label.pack(fill="x")
+        self._header_label.bind("<MouseWheel>", self._on_mouse_wheel)
+        self._divider = tk.Frame(self.panel, height=1, bg=theme["popup_border"])
+        self._divider.pack(fill="x")
+        self._row_labels: list[tk.Label] = []
+        self._row_indices: list[int] = [-1] * self.MAX_VISIBLE
+        self._row_selected: list[bool] = [False] * self.MAX_VISIBLE
+        self._row_colors: list[tuple[str, str, str, str]] = [
+            (theme["popup_bg"], theme["item_fg"], theme["hover_bg"], theme["hover_fg"])
+            for _ in range(self.MAX_VISIBLE)
+        ]
+        for slot_idx in range(self.MAX_VISIBLE):
+            row = tk.Label(
+                self.panel,
+                text="",
+                anchor="w",
+                justify="left",
+                bg=theme["popup_bg"],
+                fg=theme["item_fg"],
+                cursor="hand2",
+            )
+            row.bind("<Button-1>", lambda _event, s=slot_idx: self._on_slot_click(s))
+            row.bind("<MouseWheel>", self._on_mouse_wheel)
+            row.bind("<Enter>", lambda _event, s=slot_idx: self._on_slot_hover(s, True))
+            row.bind("<Leave>", lambda _event, s=slot_idx: self._on_slot_hover(s, False))
+            self._row_labels.append(row)
+
         self.window.update_idletasks()
         make_popup_no_activate(int(self.window.winfo_id()))
 
@@ -2094,20 +2142,14 @@ class CandidatePopup:
         page_end = min(total, page_start + page_size)
         visible_count = page_end - page_start
 
-        for child in self.panel.winfo_children():
-            child.destroy()
-
         hint = (
             f"1-{visible_count}キー / Enter / クリックで確定"
             if selecting
             else "Space・↑↓・ホイールで選択 / クリックで確定"
         )
         header_text = f"変換中 {selected_index + 1}/{total}  ({hint})"
-        header = tk.Label(
-            self.panel,
+        self._header_label.configure(
             text=header_text,
-            anchor="w",
-            justify="left",
             wraplength=content_wrap,
             bg=theme["header_bg"],
             fg=theme["header_fg"],
@@ -2115,38 +2157,35 @@ class CandidatePopup:
             padx=padx,
             pady=max(2, pady - 1),
         )
-        header.pack(fill="x")
-        header.bind("<MouseWheel>", self._on_mouse_wheel)
-        divider = tk.Frame(self.panel, height=1, bg=theme["popup_border"])
-        divider.pack(fill="x")
+        self._divider.configure(bg=theme["popup_border"])
 
-        for index in range(page_start, page_end):
-            selected = index == selected_index
-            slot = index - page_start + 1
-            prefix = f"▸ {slot}. " if selected else f"   {slot}. "
-            base_bg = theme["selected_bg"] if selected else theme["popup_bg"]
-            base_fg = theme["selected_fg"] if selected else theme["item_fg"]
-            row = tk.Label(
-                self.panel,
-                text=f"{prefix}{candidates[index]}",
-                anchor="w",
-                justify="left",
-                wraplength=content_wrap,
-                bg=base_bg,
-                fg=base_fg,
-                font=("Yu Gothic UI", item_pt, "bold" if selected else "normal"),
-                padx=padx,
-                pady=pady,
-                cursor="hand2",
-            )
-            row.pack(fill="x")
-            row.bind("<Button-1>", lambda _event, idx=index: self._on_row_click(idx))
-            row.bind("<MouseWheel>", self._on_mouse_wheel)
-            if not selected:
-                hover_bg = theme["hover_bg"]
-                hover_fg = theme["hover_fg"]
-                row.bind("<Enter>", lambda _event, widget=row, bg=hover_bg, fg=hover_fg: widget.configure(bg=bg, fg=fg))
-                row.bind("<Leave>", lambda _event, widget=row, bg=base_bg, fg=base_fg: widget.configure(bg=bg, fg=fg))
+        for slot_idx in range(self.MAX_VISIBLE):
+            row = self._row_labels[slot_idx]
+            cand_idx = page_start + slot_idx
+            if cand_idx < page_end:
+                selected = cand_idx == selected_index
+                prefix = f"▸ {slot_idx + 1}. " if selected else f"   {slot_idx + 1}. "
+                base_bg = theme["selected_bg"] if selected else theme["popup_bg"]
+                base_fg = theme["selected_fg"] if selected else theme["item_fg"]
+                self._row_indices[slot_idx] = cand_idx
+                self._row_selected[slot_idx] = selected
+                self._row_colors[slot_idx] = (base_bg, base_fg, theme["hover_bg"], theme["hover_fg"])
+                row.configure(
+                    text=f"{prefix}{candidates[cand_idx]}",
+                    wraplength=content_wrap,
+                    bg=base_bg,
+                    fg=base_fg,
+                    font=("Yu Gothic UI", item_pt, "bold" if selected else "normal"),
+                    padx=padx,
+                    pady=pady,
+                )
+                if not row.winfo_ismapped():
+                    row.pack(fill="x")
+            else:
+                self._row_indices[slot_idx] = -1
+                self._row_selected[slot_idx] = False
+                if row.winfo_ismapped():
+                    row.pack_forget()
 
         self.window.update_idletasks()
         width = max(
@@ -2169,6 +2208,24 @@ class CandidatePopup:
         try:
             position_popup_no_activate(_top_window_hwnd(self.window), x, y, width, height)
         except OSError:
+            pass
+
+    def _on_slot_click(self, slot_idx: int) -> None:
+        if 0 <= slot_idx < len(self._row_indices):
+            cand_idx = self._row_indices[slot_idx]
+            if cand_idx >= 0:
+                self._on_row_click(cand_idx)
+
+    def _on_slot_hover(self, slot_idx: int, entering: bool) -> None:
+        if not (0 <= slot_idx < len(self._row_labels)) or self._row_selected[slot_idx]:
+            return
+        base_bg, base_fg, hover_bg, hover_fg = self._row_colors[slot_idx]
+        try:
+            self._row_labels[slot_idx].configure(
+                bg=hover_bg if entering else base_bg,
+                fg=hover_fg if entering else base_fg,
+            )
+        except tk.TclError:
             pass
 
     def _on_row_click(self, index: int) -> None:
@@ -2610,7 +2667,7 @@ class AzooKeyLiveBridge:
                 "minimize_to_tray": "1" if self.minimize_to_tray_var.get() else "0",
                 "start_minimized": "1" if self.start_minimized_var.get() else "0",
                 "use_zenzai": "1" if self.use_zenzai_var.get() else "0",
-                "zenzai_profile": self.zenzai_profile_var.get().strip(),
+                "zenzai_profile": _sanitize_zenzai_profile(self.zenzai_profile_var.get()),
                 "zenzai_backend": self.zenzai_backend_var.get(),
             }
         )
@@ -5110,6 +5167,8 @@ class AzooKeyLiveBridge:
                 search_entry.focus_set(),
             ),
         )
+        for key_seq in ("<Return>", "<KP_Enter>"):
+            clear_btn.bind(key_seq, lambda _e, b=clear_btn: (b.invoke(), "break")[-1])
         clear_btn.grid(row=0, column=2, padx=(_scale_px(6, self._root_dpi), 0))
 
         def _schedule_learning_search(*_args) -> None:
@@ -5159,12 +5218,15 @@ class AzooKeyLiveBridge:
         btn_row.grid(row=4, column=0, sticky="ew", pady=(_scale_px(8, self._root_dpi), 0))
 
         def _viewer_btn(text: str, command, *, style: str = "Settings.TButton") -> ttk.Button:
-            return ttk.Button(
+            btn = ttk.Button(
                 btn_row,
                 text=text,
                 style=style,
                 command=command,
             )
+            for key_seq in ("<Return>", "<KP_Enter>"):
+                btn.bind(key_seq, lambda _e, b=btn: (b.invoke(), "break")[-1])
+            return btn
 
         copy_btn = _viewer_btn(
             "コピー",

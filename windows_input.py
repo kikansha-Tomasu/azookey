@@ -1615,16 +1615,52 @@ def taskbar_toggle_position(anchor_hwnd: int, width: int, height: int) -> tuple[
     return int(x), int(y)
 
 
-def send_virtual_key(vk: int) -> None:
-    send_virtual_keys(vk, 1)
+def send_virtual_key(vk: int, *, target_hwnd: int = 0) -> None:
+    send_virtual_keys(vk, 1, target_hwnd=target_hwnd)
 
 
-def send_virtual_keys(vk: int, count: int) -> None:
+def _target_window_lost(target_hwnd: int) -> bool:
+    return bool(target_hwnd) and foreground_window() != target_hwnd
+
+
+def _ensure_modifiers_released(*, include_shift: bool = False) -> None:
+    """Release held Ctrl/Alt/Win (and optionally Shift) keys before synthetic navigation/deletion."""
+    modifier_vks: list[tuple[int, int]] = [
+        (VK_LCONTROL, 0),
+        (VK_RCONTROL, KEYEVENTF_EXTENDEDKEY),
+        (VK_LMENU, 0),
+        (VK_RMENU, KEYEVENTF_EXTENDEDKEY),
+        (VK_LWIN, KEYEVENTF_EXTENDEDKEY),
+        (VK_RWIN, KEYEVENTF_EXTENDEDKEY),
+    ]
+    if include_shift:
+        modifier_vks.extend([(VK_LSHIFT, 0), (VK_RSHIFT, KEYEVENTF_EXTENDEDKEY)])
+    inputs: list[INPUT] = []
+    for mod_vk, ext in modifier_vks:
+        if user32.GetAsyncKeyState(mod_vk) & 0x8000:
+            scan = int(user32.MapVirtualKeyW(mod_vk, 0) or 0)
+            inputs.append(
+                INPUT(
+                    type=INPUT_KEYBOARD,
+                    ki=KEYBDINPUT(mod_vk, scan, ext | KEYEVENTF_KEYUP, 0, APP_INJECTION_TAG),
+                )
+            )
+    if inputs:
+        _send_inputs(inputs)
+        time.sleep(0.004)
+
+
+def send_virtual_keys(vk: int, count: int, *, target_hwnd: int = 0) -> None:
     if count <= 0:
         return
+    if _target_window_lost(target_hwnd):
+        return
+    _ensure_modifiers_released(include_shift=False)
     scan_code = int(user32.MapVirtualKeyW(vk, 0) or 0)
     ext_flag = KEYEVENTF_EXTENDEDKEY if vk in _EXTENDED_VKS else 0
     for index in range(count):
+        if _target_window_lost(target_hwnd):
+            return
         _send_inputs(
             [
                 INPUT(
@@ -1664,6 +1700,15 @@ def _ensure_shift_released() -> None:
         time.sleep(0.005)
 
 
+def _is_emoji_like_char(ch: str) -> bool:
+    code = ord(ch)
+    return (
+        code >= 0x1F000
+        or 0x2600 <= code <= 0x27BF
+        or code in (0x200D, 0xFE0F, 0x20E3)
+    )
+
+
 def _split_grapheme_clusters(text: str) -> list[str]:
     """Split text into approximate user-perceived grapheme clusters (combining/ZWJ/VS/flags)."""
     if not text:
@@ -1675,6 +1720,7 @@ def _split_grapheme_clusters(text: str) -> list[str]:
         start = index
         ch = text[index]
         code = ord(ch)
+        is_emoji_cluster = _is_emoji_like_char(ch)
         index += 1
         # Pair Regional Indicator symbols (country flags).
         if 0x1F1E6 <= code <= 0x1F1FF and index < length:
@@ -1685,16 +1731,18 @@ def _split_grapheme_clusters(text: str) -> list[str]:
             nxt = text[index]
             nxt_code = ord(nxt)
             if nxt_code == 0x200D:  # Zero-Width Joiner
-                index += 1
-                if index < length:
-                    index += 1
-                continue
+                if is_emoji_cluster and index + 1 < length and _is_emoji_like_char(text[index + 1]):
+                    index += 2
+                    continue
+                break
             if (
                 nxt_code in (0xFE0E, 0xFE0F, 0x20E3)
                 or (0x1F3FB <= nxt_code <= 0x1F3FF)
                 or (0xE0020 <= nxt_code <= 0xE007F)
                 or unicodedata.category(nxt) in ("Mn", "Mc", "Me")
             ):
+                if nxt_code in (0xFE0F, 0x20E3) or (0x1F3FB <= nxt_code <= 0x1F3FF):
+                    is_emoji_cluster = True
                 index += 1
                 continue
             break
@@ -1702,11 +1750,16 @@ def _split_grapheme_clusters(text: str) -> list[str]:
     return clusters
 
 
-def send_backspaces(count: int) -> None:
+def send_backspaces(count: int, *, target_hwnd: int = 0) -> None:
     if count <= 0:
         return
+    if _target_window_lost(target_hwnd):
+        return
+    _ensure_modifiers_released(include_shift=False)
     scan_code = int(user32.MapVirtualKeyW(VK_BACK, 0) or 0x0E)
     for index in range(count):
+        if _target_window_lost(target_hwnd):
+            return
         _send_inputs(
             [
                 INPUT(
@@ -1723,7 +1776,7 @@ def send_backspaces(count: int) -> None:
             time.sleep(0.004)
 
 
-def replace_unicode_text(old_text: str, new_text: str) -> None:
+def replace_unicode_text(old_text: str, new_text: str, *, target_hwnd: int = 0) -> None:
     if old_text == new_text:
         return
     old_clusters = _split_grapheme_clusters(old_text)
@@ -1735,11 +1788,11 @@ def replace_unicode_text(old_text: str, new_text: str) -> None:
     backspaces = len(old_clusters) - common
     suffix = "".join(new_clusters[common:])
     if backspaces > 0:
-        send_backspaces(backspaces)
+        send_backspaces(backspaces, target_hwnd=target_hwnd)
         if suffix:
             time.sleep(0.008)
     if suffix:
-        send_unicode_text(suffix)
+        send_unicode_text(suffix, target_hwnd=target_hwnd)
 
 
 def sync_unicode_text(
@@ -1747,6 +1800,8 @@ def sync_unicode_text(
     old_cursor: int,
     new_text: str,
     new_cursor: int,
+    *,
+    target_hwnd: int = 0,
 ) -> None:
     """Update editor text from (old_text, old_cursor) to (new_text, new_cursor)."""
     old_len = len(old_text)
@@ -1761,10 +1816,10 @@ def sync_unicode_text(
             _ensure_shift_released()
             if new_pos < old_pos:
                 steps = len(_split_grapheme_clusters(old_text[new_pos:old_pos]))
-                send_virtual_keys(VK_LEFT, steps)
+                send_virtual_keys(VK_LEFT, steps, target_hwnd=target_hwnd)
             else:
                 steps = len(_split_grapheme_clusters(old_text[old_pos:new_pos]))
-                send_virtual_keys(VK_RIGHT, steps)
+                send_virtual_keys(VK_RIGHT, steps, target_hwnd=target_hwnd)
         return
 
     old_left = old_text[:old_pos]
@@ -1773,7 +1828,7 @@ def sync_unicode_text(
     new_right = new_text[new_pos:]
 
     if old_right == new_right:
-        replace_unicode_text(old_left, new_left)
+        replace_unicode_text(old_left, new_left, target_hwnd=target_hwnd)
         return
 
     if (
@@ -1783,25 +1838,27 @@ def sync_unicode_text(
     ):
         _ensure_shift_released()
         deleted = old_right[: len(old_right) - len(new_right)]
-        send_virtual_keys(VK_DELETE, len(_split_grapheme_clusters(deleted)))
+        send_virtual_keys(VK_DELETE, len(_split_grapheme_clusters(deleted)), target_hwnd=target_hwnd)
         return
 
     if clamped_old < 0:
         _ensure_shift_released()
-        send_virtual_keys(VK_RIGHT, len(_split_grapheme_clusters(old_right)))
+        send_virtual_keys(VK_RIGHT, len(_split_grapheme_clusters(old_right)), target_hwnd=target_hwnd)
         time.sleep(0.006)
-    replace_unicode_text(old_text, new_text)
+    replace_unicode_text(old_text, new_text, target_hwnd=target_hwnd)
     if clamped_new < 0:
         time.sleep(0.006)
         _ensure_shift_released()
-        send_virtual_keys(VK_LEFT, len(_split_grapheme_clusters(new_right)))
+        send_virtual_keys(VK_LEFT, len(_split_grapheme_clusters(new_right)), target_hwnd=target_hwnd)
 
 
-def send_unicode_text(text: str) -> None:
+def send_unicode_text(text: str, *, target_hwnd: int = 0) -> None:
     # Rich-text and async UI editors can lose or reorder characters when many
     # Unicode packets are queued in a single SendInput call. Send one character
     # at a time so each character is consumed in order.
     for index, character in enumerate(text):
+        if _target_window_lost(target_hwnd):
+            return
         encoded = character.encode("utf-16-le")
         inputs: list[INPUT] = []
         for offset in range(0, len(encoded), 2):
@@ -1838,7 +1895,9 @@ def _send_inputs(inputs: list[INPUT]) -> None:
         )
 
 
-_HOOK_WAIT_TIMEOUT = 0.22
+# Keep synchronous hook wait well below Windows LowLevelHooksTimeout (200-300ms)
+# to avoid silent OS unhooking during slow editor updates.
+_HOOK_WAIT_TIMEOUT = 0.08
 
 
 class KeyboardHook:
