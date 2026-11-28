@@ -26,14 +26,35 @@ DEFAULT_ENGINE_SETTINGS = {
 
 VALID_BACKENDS = ("cpu", "vulkan", "cuda")
 _APPDATA_FALLBACK_ORIGIN: tuple[str, str] | None = None
+_ENGINE_SETTINGS_LOCK = threading.Lock()
+
+
+def _write_text_atomic(target: Path, content: str) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_path, target)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def preferred_appdata_dir() -> str:
     """Return the pre-fallback APPDATA path when _ensure_engine_settings redirected APPDATA."""
-    current = os.environ.get("APPDATA", "")
-    if _APPDATA_FALLBACK_ORIGIN is not None and current == _APPDATA_FALLBACK_ORIGIN[0]:
-        return _APPDATA_FALLBACK_ORIGIN[1]
-    return current
+    with _ENGINE_SETTINGS_LOCK:
+        current = os.environ.get("APPDATA", "")
+        if _APPDATA_FALLBACK_ORIGIN is not None and current == _APPDATA_FALLBACK_ORIGIN[0]:
+            return _APPDATA_FALLBACK_ORIGIN[1]
+        return current
 
 
 def _ensure_engine_settings(
@@ -44,51 +65,55 @@ def _ensure_engine_settings(
     zenzai_backend: str | None = None,
 ) -> Path | None:
     """Ensure %APPDATA%\\Azookey\\settings.json exists and reflects the Zenzai config."""
+    global _APPDATA_FALLBACK_ORIGIN
     has_model = (folder / "zenz.gguf").is_file()
     desired_enable = has_model if use_zenzai is None else (bool(use_zenzai) and has_model)
-    raw_appdata = preferred_appdata_dir()
-    appdata = Path(raw_appdata) if raw_appdata else (Path.home() / "AppData" / "Roaming")
-    for base in (appdata, folder / ".appdata"):
-        settings_file = base / "Azookey" / "settings.json"
-        try:
-            existing: dict | None = None
-            if settings_file.is_file():
-                try:
-                    loaded = json.loads(settings_file.read_text(encoding="utf-8"))
-                    if isinstance(loaded, dict):
-                        existing = loaded
-                except (ValueError, TypeError):
-                    existing = None
-            payload = dict(DEFAULT_ENGINE_SETTINGS)
-            zenzai_cfg = dict(DEFAULT_ENGINE_SETTINGS["zenzai"])
-            if existing is not None:
-                payload.update(existing)
-                if isinstance(existing.get("zenzai"), dict):
-                    zenzai_cfg.update(existing["zenzai"])
-            zenzai_cfg["enable"] = desired_enable
-            if zenzai_profile is not None:
-                zenzai_cfg["profile"] = str(zenzai_profile)
-            if zenzai_backend is not None and zenzai_backend in VALID_BACKENDS:
-                zenzai_cfg["backend"] = zenzai_backend
-            elif zenzai_cfg.get("backend") not in VALID_BACKENDS:
-                zenzai_cfg["backend"] = "cpu"
-            payload["zenzai"] = zenzai_cfg
-            settings_file.parent.mkdir(parents=True, exist_ok=True)
-            settings_file.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            global _APPDATA_FALLBACK_ORIGIN
-            if base != appdata:
-                _APPDATA_FALLBACK_ORIGIN = (str(base), str(appdata))
-                os.environ["APPDATA"] = str(base)
-            elif _APPDATA_FALLBACK_ORIGIN is not None:
-                os.environ["APPDATA"] = _APPDATA_FALLBACK_ORIGIN[1]
-                _APPDATA_FALLBACK_ORIGIN = None
-            return settings_file
-        except OSError:
-            continue
-    return None
+    with _ENGINE_SETTINGS_LOCK:
+        current_appdata = os.environ.get("APPDATA", "")
+        if _APPDATA_FALLBACK_ORIGIN is not None and current_appdata == _APPDATA_FALLBACK_ORIGIN[0]:
+            raw_appdata = _APPDATA_FALLBACK_ORIGIN[1]
+        else:
+            raw_appdata = current_appdata
+        appdata = Path(raw_appdata) if raw_appdata else (Path.home() / "AppData" / "Roaming")
+        for base in (appdata, folder / ".appdata"):
+            settings_file = base / "Azookey" / "settings.json"
+            try:
+                existing: dict | None = None
+                if settings_file.is_file():
+                    try:
+                        loaded = json.loads(settings_file.read_text(encoding="utf-8"))
+                        if isinstance(loaded, dict):
+                            existing = loaded
+                    except (ValueError, TypeError):
+                        existing = None
+                payload = dict(DEFAULT_ENGINE_SETTINGS)
+                zenzai_cfg = dict(DEFAULT_ENGINE_SETTINGS["zenzai"])
+                if existing is not None:
+                    payload.update(existing)
+                    if isinstance(existing.get("zenzai"), dict):
+                        zenzai_cfg.update(existing["zenzai"])
+                zenzai_cfg["enable"] = desired_enable
+                if zenzai_profile is not None:
+                    zenzai_cfg["profile"] = str(zenzai_profile)
+                if zenzai_backend is not None and zenzai_backend in VALID_BACKENDS:
+                    zenzai_cfg["backend"] = zenzai_backend
+                elif zenzai_cfg.get("backend") not in VALID_BACKENDS:
+                    zenzai_cfg["backend"] = "cpu"
+                payload["zenzai"] = zenzai_cfg
+                _write_text_atomic(
+                    settings_file,
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                )
+                if base != appdata:
+                    _APPDATA_FALLBACK_ORIGIN = (str(base), str(appdata))
+                    os.environ["APPDATA"] = str(base)
+                elif _APPDATA_FALLBACK_ORIGIN is not None:
+                    os.environ["APPDATA"] = _APPDATA_FALLBACK_ORIGIN[1]
+                    _APPDATA_FALLBACK_ORIGIN = None
+                return settings_file
+            except OSError:
+                continue
+        return None
 
 
 @dataclass(frozen=True)
@@ -123,7 +148,8 @@ _CUDA_DRIVER_DLL = "nvcuda.dll"
 _CUDA_RUNTIME_DLLS = ("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll")
 _VULKAN_LOADER_DLL = "vulkan-1.dll"
 _VULKAN_PROBE_TTL = 5.0
-_VULKAN_PROBE_CACHE: dict[str, tuple[float, bool, str]] = {}
+_VULKAN_PROBE_LOCK = threading.Lock()
+_VULKAN_PROBE_CACHE: dict[tuple[str, bool], tuple[float, bool, str]] = {}
 _VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO = 1
 _VK_SUCCESS = 0
 _VK_INCOMPLETE = 5
@@ -144,15 +170,17 @@ class _VkInstanceCreateInfo(ctypes.Structure):
 
 def _probe_vulkan_device(vulkan_dir: Path, *, use_system_loader: bool = False) -> tuple[bool, str]:
     """Verify via Vulkan loader that at least one usable GPU physical device exists."""
-    cache_key = os.path.normcase(str(vulkan_dir))
+    cache_key = (os.path.normcase(str(vulkan_dir)), bool(use_system_loader))
     now = time.monotonic()
-    cached = _VULKAN_PROBE_CACHE.get(cache_key)
-    if cached is not None and now - cached[0] < _VULKAN_PROBE_TTL:
-        return cached[1], cached[2]
+    with _VULKAN_PROBE_LOCK:
+        cached = _VULKAN_PROBE_CACHE.get(cache_key)
+        if cached is not None and now - cached[0] < _VULKAN_PROBE_TTL:
+            return cached[1], cached[2]
 
     dll_dir_handle = None
     instance = ctypes.c_void_p()
     vulkan = None
+    result: tuple[bool, str]
     try:
         if use_system_loader:
             vulkan = ctypes.WinDLL(_VULKAN_LOADER_DLL)
@@ -178,32 +206,32 @@ def _probe_vulkan_device(vulkan_dir: Path, *, use_system_loader: bool = False) -
         rc = int(vulkan.vkCreateInstance(ctypes.byref(info), None, ctypes.byref(instance)))
         if rc != _VK_SUCCESS or not instance.value:
             result = (False, "Vulkan インスタンスを初期化できないため、対応 GPU が利用できません。")
-            _VULKAN_PROBE_CACHE[cache_key] = (now, result[0], result[1])
-            return result
-        device_count = ctypes.c_uint32(0)
-        rc_enum = int(vulkan.vkEnumeratePhysicalDevices(instance, ctypes.byref(device_count), None))
-        if rc_enum not in (_VK_SUCCESS, _VK_INCOMPLETE) or device_count.value <= 0:
-            result = (False, "利用可能な Vulkan GPU デバイス（ドライバ/ICD）が見つかりません。")
-            _VULKAN_PROBE_CACHE[cache_key] = (now, result[0], result[1])
-            return result
-        result = (True, "")
-        _VULKAN_PROBE_CACHE[cache_key] = (now, result[0], result[1])
-        return result
-    except (OSError, AttributeError, ValueError):
+        else:
+            device_count = ctypes.c_uint32(0)
+            rc_enum = int(vulkan.vkEnumeratePhysicalDevices(instance, ctypes.byref(device_count), None))
+            if rc_enum not in (_VK_SUCCESS, _VK_INCOMPLETE) or device_count.value <= 0:
+                result = (False, "利用可能な Vulkan GPU デバイス（ドライバ/ICD）が見つかりません。")
+            else:
+                result = (True, "")
+    except (OSError, AttributeError, ValueError, ctypes.ArgumentError):
         result = (False, f"{_VULKAN_LOADER_DLL} を初期化できないため、Vulkan GPU を利用できません。")
-        _VULKAN_PROBE_CACHE[cache_key] = (now, result[0], result[1])
-        return result
     finally:
         if vulkan is not None and instance.value:
             try:
                 vulkan.vkDestroyInstance(instance, None)
             except Exception:
                 pass
+        if vulkan is not None and not use_system_loader:
+            _try_free_library(vulkan)
         if dll_dir_handle is not None:
             try:
                 dll_dir_handle.close()
             except Exception:
                 pass
+
+    with _VULKAN_PROBE_LOCK:
+        _VULKAN_PROBE_CACHE[cache_key] = (time.monotonic(), result[0], result[1])
+    return result
 
 
 def _try_free_library(library: object) -> None:
@@ -466,8 +494,10 @@ def diagnose_backend(engine_dir: str | Path, backend: str) -> BackendDiagnostic:
         )
 
     search_dirs = _cuda_search_dirs(folder)
+    driver_extra_dir: Path | None = None
     if not has_nvidia_driver:
-        has_nvidia_driver = _find_dll_dir(_CUDA_DRIVER_DLL, search_dirs) is not None
+        driver_extra_dir = _find_dll_dir(_CUDA_DRIVER_DLL, search_dirs)
+        has_nvidia_driver = driver_extra_dir is not None
 
     base_norms = {
         os.path.normcase(str(path))
@@ -475,6 +505,11 @@ def diagnose_backend(engine_dir: str | Path, backend: str) -> BackendDiagnostic:
     }
     extra_dirs: list[Path] = []
     seen_extra: set[str] = set()
+    if driver_extra_dir is not None:
+        norm_driver = os.path.normcase(str(driver_extra_dir))
+        if norm_driver not in base_norms:
+            seen_extra.add(norm_driver)
+            extra_dirs.append(driver_extra_dir)
     missing_runtime: list[str] = []
     for dll_name in _CUDA_RUNTIME_DLLS:
         found_dir = _find_dll_dir(dll_name, search_dirs)
@@ -525,9 +560,11 @@ class AzooKeyRuntime:
     """Loads the bundled conversion library without registering a Windows IME."""
 
     def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._call_lock = threading.RLock()
         self._library = None
         self._dll_directory_handles = []
-        self._path_prefix: str = ""
+        self._added_path_entries: list[str] = []
         self._folder: Path | None = None
         self._client: AzooKeyClient | None = None
         self.active_backend: str = "cpu"
@@ -552,6 +589,8 @@ class AzooKeyRuntime:
         zenzai_profile: str = "",
         zenzai_backend: str = "cpu",
     ) -> "AzooKeyClient":
+        if sys.maxsize <= 2**32:
+            raise RuntimeError("AzooKey 変換エンジン（x64）を読み込むには 64-bit 版 Python が必要です。")
         folder = Path(engine_dir).expanduser().resolve()
         library_path = folder / "azookey-server.dll"
         if not library_path.is_file():
@@ -559,93 +598,96 @@ class AzooKeyRuntime:
         if not (folder / "Dictionary").is_dir():
             raise RuntimeError("選んだフォルダーに AzooKey の Dictionary が見つかりません。")
 
-        backend = zenzai_backend if zenzai_backend in VALID_BACKENDS else "cpu"
-        self.requested_backend = backend
-        self.fallback_reason = ""
-        has_model = (folder / "zenz.gguf").is_file()
-        enable_zenzai = bool(use_zenzai and has_model)
+        with self._lock:
+            backend = zenzai_backend if zenzai_backend in VALID_BACKENDS else "cpu"
+            self.requested_backend = backend
+            self.fallback_reason = ""
+            has_model = (folder / "zenz.gguf").is_file()
+            enable_zenzai = bool(use_zenzai and has_model)
 
-        if self._library is not None:
-            if folder != self._folder:
-                raise RuntimeError("変換エンジンの場所を変更するには、アプリを再起動してください。")
-            if backend != self.active_backend:
-                diag = diagnose_backend(folder, backend)
-                self.fallback_reason = (
-                    diag.reason
-                    if (not diag.ready and diag.reason)
-                    else "推論バックエンドを変更するには、アプリの再起動が必要です。"
+            if self._library is not None:
+                if folder != self._folder:
+                    raise RuntimeError("変換エンジンの場所を変更するには、アプリを再起動してください。")
+                if backend != self.active_backend:
+                    diag = diagnose_backend(folder, backend)
+                    self.fallback_reason = (
+                        diag.reason
+                        if (not diag.ready and diag.reason)
+                        else "推論バックエンドを変更するには、アプリの再起動が必要です。"
+                    )
+                _ensure_engine_settings(
+                    folder,
+                    use_zenzai=enable_zenzai,
+                    zenzai_profile=zenzai_profile,
+                    zenzai_backend=self.active_backend,
                 )
-            _ensure_engine_settings(
-                folder,
-                use_zenzai=enable_zenzai,
-                zenzai_profile=zenzai_profile,
-                zenzai_backend=self.active_backend,
-            )
-            self._client = AzooKeyClient(self._library, folder=folder)
+                self._client = AzooKeyClient(self._library, folder=folder, call_lock=self._call_lock)
+                self._client.update_config()
+                self._client.clear_text()
+                return self._client
+
+            preferred_backends = [backend] if backend == "cpu" else [backend, "cpu"]
+            last_error: Exception | None = None
+            last_reason = ""
+            library = None
+            chosen_backend = "cpu"
+            base_path = os.environ.get("PATH", "")
+
+            for idx, candidate_backend in enumerate(preferred_backends):
+                backend_dir = folder / f"llama_{candidate_backend}"
+                diag = diagnose_backend(folder, candidate_backend)
+                has_fallback = idx + 1 < len(preferred_backends)
+                if not diag.ready and has_fallback:
+                    last_reason = diag.reason
+                    continue
+                _ensure_engine_settings(
+                    folder,
+                    use_zenzai=enable_zenzai,
+                    zenzai_profile=zenzai_profile,
+                    zenzai_backend=candidate_backend,
+                )
+                search_dirs = _dedupe_existing_dirs([backend_dir, *diag.extra_dll_dirs, folder])
+                added_entries = [str(path) for path in search_dirs]
+                added_str = os.pathsep.join(added_entries)
+                path_prefix = f"{added_str}{os.pathsep}" if (added_str and base_path) else added_str
+                os.environ["PATH"] = f"{path_prefix}{base_path}" if path_prefix else base_path
+                handles = []
+                try:
+                    for path in search_dirs:
+                        handles.append(os.add_dll_directory(str(path)))
+                    library = ctypes.WinDLL(str(library_path))
+                    _configure_native_api(library)
+                    library.Initialize(str(folder).encode("utf-8"), has_model)
+                    self._dll_directory_handles = handles
+                    self._added_path_entries = added_entries
+                    chosen_backend = candidate_backend
+                    break
+                except (OSError, AttributeError) as exc:
+                    last_error = exc
+                    last_reason = diag.reason if (not diag.ready and diag.reason) else str(exc)
+                    if library is not None:
+                        _try_free_library(library)
+                    library = None
+                    os.environ["PATH"] = base_path
+                    self._close_dll_handles(handles)
+
+            if library is None:
+                detail = last_reason or (str(last_error) if last_error is not None else "unknown error")
+                raise RuntimeError(f"AzooKey の変換 DLL を読み込めません: {detail}") from last_error
+
+            self.active_backend = chosen_backend
+            if chosen_backend != backend:
+                self.fallback_reason = (
+                    last_reason
+                    or (str(last_error) if last_error is not None else "unavailable")
+                )
+
+            self._library = library
+            self._folder = folder
+            self._client = AzooKeyClient(library, folder=folder, call_lock=self._call_lock)
             self._client.update_config()
             self._client.clear_text()
             return self._client
-
-        preferred_backends = [backend] if backend == "cpu" else [backend, "cpu"]
-        last_error: Exception | None = None
-        last_reason = ""
-        library = None
-        chosen_backend = "cpu"
-        base_path = os.environ.get("PATH", "")
-
-        for idx, candidate_backend in enumerate(preferred_backends):
-            backend_dir = folder / f"llama_{candidate_backend}"
-            diag = diagnose_backend(folder, candidate_backend)
-            has_fallback = idx + 1 < len(preferred_backends)
-            if not diag.ready and has_fallback:
-                last_reason = diag.reason
-                continue
-            _ensure_engine_settings(
-                folder,
-                use_zenzai=enable_zenzai,
-                zenzai_profile=zenzai_profile,
-                zenzai_backend=candidate_backend,
-            )
-            search_dirs = _dedupe_existing_dirs([backend_dir, *diag.extra_dll_dirs, folder])
-            added_str = os.pathsep.join(str(path) for path in search_dirs)
-            path_prefix = f"{added_str}{os.pathsep}" if (added_str and base_path) else added_str
-            os.environ["PATH"] = f"{path_prefix}{base_path}" if path_prefix else base_path
-            handles = []
-            try:
-                handles = [os.add_dll_directory(str(path)) for path in search_dirs]
-                library = ctypes.WinDLL(str(library_path))
-                _configure_native_api(library)
-                library.Initialize(str(folder).encode("utf-8"), has_model)
-                self._dll_directory_handles = handles
-                self._path_prefix = path_prefix
-                chosen_backend = candidate_backend
-                break
-            except (OSError, AttributeError) as exc:
-                last_error = exc
-                last_reason = diag.reason if (not diag.ready and diag.reason) else str(exc)
-                if library is not None:
-                    _try_free_library(library)
-                library = None
-                os.environ["PATH"] = base_path
-                self._close_dll_handles(handles)
-
-        if library is None:
-            detail = last_reason or (str(last_error) if last_error is not None else "unknown error")
-            raise RuntimeError(f"AzooKey の変換 DLL を読み込めません: {detail}") from last_error
-
-        self.active_backend = chosen_backend
-        if chosen_backend != backend:
-            self.fallback_reason = (
-                last_reason
-                or (str(last_error) if last_error is not None else "unavailable")
-            )
-
-        self._library = library
-        self._folder = folder
-        self._client = AzooKeyClient(library, folder=folder)
-        self._client.update_config()
-        self._client.clear_text()
-        return self._client
 
     @staticmethod
     def _close_dll_handles(handles: list) -> None:
@@ -656,22 +698,31 @@ class AzooKeyRuntime:
                 pass
 
     def close(self) -> None:
-        if self._client is not None:
-            self._client.clear_text()
-            self._client = None
-        if self._dll_directory_handles:
-            self._close_dll_handles(self._dll_directory_handles)
-            self._dll_directory_handles = []
-        if self._path_prefix:
-            current_path = os.environ.get("PATH", "")
-            if current_path == self._path_prefix:
-                os.environ["PATH"] = ""
-            elif current_path.startswith(self._path_prefix):
-                remainder = current_path[len(self._path_prefix) :]
-                if not self._path_prefix.endswith(os.pathsep) and remainder.startswith(os.pathsep):
-                    remainder = remainder[len(os.pathsep) :]
-                os.environ["PATH"] = remainder
-            self._path_prefix = ""
+        with self._lock:
+            if self._client is not None:
+                try:
+                    self._client.clear_text()
+                except Exception:
+                    pass
+                self._client = None
+            if self._dll_directory_handles:
+                self._close_dll_handles(self._dll_directory_handles)
+                self._dll_directory_handles = []
+            if self._added_path_entries:
+                remove_counts: dict[str, int] = {}
+                for entry in self._added_path_entries:
+                    key = os.path.normcase(entry)
+                    remove_counts[key] = remove_counts.get(key, 0) + 1
+                current_entries = os.environ.get("PATH", "").split(os.pathsep)
+                remaining: list[str] = []
+                for entry in current_entries:
+                    key = os.path.normcase(entry)
+                    if remove_counts.get(key, 0) > 0:
+                        remove_counts[key] -= 1
+                        continue
+                    remaining.append(entry)
+                os.environ["PATH"] = os.pathsep.join(remaining)
+                self._added_path_entries = []
 
 
 def _configure_native_api(library) -> None:
@@ -705,19 +756,26 @@ def _configure_native_api(library) -> None:
 class AzooKeyClient:
     SUPPORTS_CURSOR_OFFSET = True
 
-    def __init__(self, library, *, folder: Path | None = None) -> None:
+    def __init__(
+        self,
+        library,
+        *,
+        folder: Path | None = None,
+        call_lock: threading.RLock | None = None,
+    ) -> None:
         self._library = library
         self._folder = folder
-        self._call_lock = threading.RLock()
+        self._call_lock = call_lock if call_lock is not None else threading.RLock()
         self._cursor_pos = 0
         self._hiragana_len = 0
 
     @property
     def cursor_offset(self) -> int:
         """Current engine cursor relative to the end of the buffer (0 = end, negative = left)."""
-        if self._hiragana_len <= 0:
-            return 0
-        return max(-self._hiragana_len, min(0, self._cursor_pos - self._hiragana_len))
+        with self._call_lock:
+            if self._hiragana_len <= 0:
+                return 0
+            return max(-self._hiragana_len, min(0, self._cursor_pos - self._hiragana_len))
 
     def _update_absolute_cursor(self, hiragana: str, cursor_pos: int) -> int:
         self._hiragana_len = len(hiragana)
@@ -726,11 +784,12 @@ class AzooKeyClient:
 
     def append_text_raw_with_cursor(self, text: str) -> tuple[str, int]:
         """Append text to the engine buffer and return (hiragana, cursor_offset)."""
-        if not text:
+        sanitized = text.replace("\x00", "") if text else ""
+        if not sanitized:
             return "", self.cursor_offset
         cursor = ctypes.c_int()
         with self._call_lock:
-            hiragana_pointer = self._library.AppendText(text.encode("utf-8"), ctypes.byref(cursor))
+            hiragana_pointer = self._library.AppendText(sanitized.encode("utf-8"), ctypes.byref(cursor))
             hiragana = _read_utf8(hiragana_pointer)
             return hiragana, self._update_absolute_cursor(hiragana, cursor.value)
 
@@ -812,8 +871,9 @@ class AzooKeyClient:
 
     def set_context(self, context: str) -> None:
         if hasattr(self._library, "SetContext"):
+            sanitized = context.replace("\x00", "") if context else ""
             with self._call_lock:
-                self._library.SetContext(context.encode("utf-8"))
+                self._library.SetContext(sanitized.encode("utf-8"))
 
     def update_config(self) -> None:
         with self._call_lock:
@@ -856,6 +916,8 @@ class AzooKeyClient:
         # (for example, "tou" returns around 244 from this engine).
         if count.value < 0 or count.value > 512:
             raise RuntimeError(f"AzooKey が不正な候補数を返しました: {count.value}")
+        if not candidates or count.value == 0:
+            return Composition(hiragana, ())
 
         suggestions: list[Suggestion] = []
         for index in range(count.value):
@@ -867,7 +929,7 @@ class AzooKeyClient:
                 Suggestion(
                     text=_read_utf8(candidate.text),
                     subtext=_read_utf8(candidate.subtext),
-                    corresponding_count=candidate.corresponding_count,
+                    corresponding_count=max(0, int(candidate.corresponding_count)),
                 )
             )
         return Composition(hiragana, tuple(suggestions))

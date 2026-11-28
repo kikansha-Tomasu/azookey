@@ -4,3 +4,15 @@ venv/
 *.py[cod]
 /azookey-runtime/
 /tools/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+*.egg-info/
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+*.log
+.env

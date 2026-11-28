@@ -10,6 +10,7 @@ import queue
 import threading
 import time
 import typing
+import unicodedata
 import winreg
 
 
@@ -250,8 +251,15 @@ GA_ROOT = 2
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
 HWND_TOPMOST = wintypes.HWND(-1)
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
 SWP_SHOWWINDOW = 0x0040
+SM_CXSCREEN = 0
+SM_CYSCREEN = 1
+ERROR_CLASS_ALREADY_EXISTS = 1410
 MONITOR_DEFAULTTONEAREST = 2
 WM_IME_CONTROL = 0x0283
 IMC_GETOPENSTATUS = 0x0005
@@ -284,7 +292,6 @@ WM_NULL = 0x0000
 WM_DESTROY = 0x0002
 WM_CLOSE = 0x0010
 WM_CANCELMODE = 0x001F
-WM_COMMAND = 0x0111
 WM_CONTEXTMENU = 0x007B
 WM_LBUTTONUP = 0x0202
 WM_LBUTTONDBLCLK = 0x0203
@@ -549,8 +556,13 @@ user32.UnhookWindowsHookEx.restype = wintypes.BOOL
 user32.GetMessageW.argtypes = [ctypes.POINTER(MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
 user32.GetMessageW.restype = ctypes.c_int
 user32.TranslateMessage.argtypes = [ctypes.POINTER(MSG)]
+user32.TranslateMessage.restype = wintypes.BOOL
 user32.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
+user32.DispatchMessageW.restype = ctypes.c_ssize_t
 user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+user32.PostThreadMessageW.restype = wintypes.BOOL
+user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+user32.GetSystemMetrics.restype = ctypes.c_int
 user32.GetForegroundWindow.restype = wintypes.HWND
 user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 user32.SetForegroundWindow.restype = wintypes.BOOL
@@ -589,7 +601,6 @@ user32.GetKeyboardLayout.argtypes = [wintypes.DWORD]
 user32.GetKeyboardLayout.restype = ctypes.c_void_p
 user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
 user32.MapVirtualKeyW.restype = wintypes.UINT
-user32.GetKeyboardState.argtypes = [ctypes.POINTER(ctypes.c_ubyte)]
 user32.ToUnicodeEx.argtypes = [
     wintypes.UINT,
     wintypes.UINT,
@@ -679,7 +690,7 @@ user32.TrackPopupMenu.argtypes = [
     wintypes.HWND,
     ctypes.c_void_p,
 ]
-user32.TrackPopupMenu.restype = wintypes.BOOL
+user32.TrackPopupMenu.restype = wintypes.UINT
 user32.DestroyMenu.argtypes = [wintypes.HMENU]
 user32.DestroyMenu.restype = wintypes.BOOL
 user32.DrawTextW.argtypes = [wintypes.HDC, wintypes.LPCWSTR, ctypes.c_int, ctypes.POINTER(RECT), wintypes.UINT]
@@ -1179,15 +1190,18 @@ def _token_integrity_rid(token_handle: int) -> int | None:
     return int(sub_ptr[0]) if sub_ptr else None
 
 
+_ELEVATION_LOCK = threading.Lock()
 _SELF_PRIVILEGE: tuple[bool, int] | None = None
-_LAST_ELEVATED_CHECK: tuple[int, int, bool, float] | None = None
+_ELEVATED_CACHE: dict[tuple[int, int], tuple[bool, float]] = {}
 _ELEVATION_CACHE_TTL = 1.0
+_ELEVATION_CACHE_MAX = 16
 
 
 def _current_process_privilege() -> tuple[bool, int]:
     global _SELF_PRIVILEGE
-    if _SELF_PRIVILEGE is not None:
-        return _SELF_PRIVILEGE
+    with _ELEVATION_LOCK:
+        if _SELF_PRIVILEGE is not None:
+            return _SELF_PRIVILEGE
     token = wintypes.HANDLE()
     if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(token)):
         return False, 0x2000
@@ -1199,15 +1213,23 @@ def _current_process_privilege() -> tuple[bool, int]:
             is_elev = bool(elev.TokenIsElevated)
         rid = _token_integrity_rid(int(token.value))
         result = (is_elev, (rid if rid is not None else 0x2000))
-        _SELF_PRIVILEGE = result
+        with _ELEVATION_LOCK:
+            _SELF_PRIVILEGE = result
         return result
     finally:
         kernel32.CloseHandle(token)
 
 
+def _store_elevated_cache(key: tuple[int, int], blocked: bool, now: float) -> None:
+    with _ELEVATION_LOCK:
+        if len(_ELEVATED_CACHE) >= _ELEVATION_CACHE_MAX and key not in _ELEVATED_CACHE:
+            oldest_key = min(_ELEVATED_CACHE, key=lambda k: _ELEVATED_CACHE[k][1])
+            _ELEVATED_CACHE.pop(oldest_key, None)
+        _ELEVATED_CACHE[key] = (blocked, now)
+
+
 def is_window_elevated(hwnd: int) -> bool:
     """Return True when hwnd belongs to a higher-privilege process blocked by UIPI."""
-    global _LAST_ELEVATED_CHECK
     if not hwnd:
         return False
     pid = wintypes.DWORD()
@@ -1215,36 +1237,38 @@ def is_window_elevated(hwnd: int) -> bool:
     target_pid = int(pid.value or 0)
     if not target_pid or target_pid == os.getpid():
         return False
+    cache_key = (hwnd, target_pid)
     now = time.monotonic()
-    cached = _LAST_ELEVATED_CHECK
-    if cached is not None and cached[0] == hwnd and cached[1] == target_pid and now - cached[3] < _ELEVATION_CACHE_TTL:
-        return cached[2]
+    with _ELEVATION_LOCK:
+        cached = _ELEVATED_CACHE.get(cache_key)
+    if cached is not None and now - cached[1] < _ELEVATION_CACHE_TTL:
+        return cached[0]
     self_elevated, self_rid = _current_process_privilege()
-    if self_elevated:
-        _LAST_ELEVATED_CHECK = (hwnd, target_pid, False, now)
-        return False
     proc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, target_pid)
     if not proc:
         blocked = ctypes.get_last_error() == ERROR_ACCESS_DENIED
-        _LAST_ELEVATED_CHECK = (hwnd, target_pid, blocked, now)
+        _store_elevated_cache(cache_key, blocked, now)
         return blocked
     try:
         token = wintypes.HANDLE()
         if not advapi32.OpenProcessToken(proc, TOKEN_QUERY, ctypes.byref(token)):
             blocked = ctypes.get_last_error() == ERROR_ACCESS_DENIED
-            _LAST_ELEVATED_CHECK = (hwnd, target_pid, blocked, now)
+            _store_elevated_cache(cache_key, blocked, now)
             return blocked
         try:
-            elev = TOKEN_ELEVATION()
-            ret = wintypes.DWORD()
-            if advapi32.GetTokenInformation(token, TokenElevation, ctypes.byref(elev), ctypes.sizeof(elev), ctypes.byref(ret)):
-                if elev.TokenIsElevated:
-                    _LAST_ELEVATED_CHECK = (hwnd, target_pid, True, now)
-                    return True
             target_rid = _token_integrity_rid(int(token.value))
-            blocked = bool(target_rid is not None and target_rid > self_rid)
-            _LAST_ELEVATED_CHECK = (hwnd, target_pid, blocked, now)
-            return blocked
+            if target_rid is not None and target_rid > self_rid:
+                _store_elevated_cache(cache_key, True, now)
+                return True
+            if not self_elevated:
+                elev = TOKEN_ELEVATION()
+                ret = wintypes.DWORD()
+                if advapi32.GetTokenInformation(token, TokenElevation, ctypes.byref(elev), ctypes.sizeof(elev), ctypes.byref(ret)):
+                    if elev.TokenIsElevated:
+                        _store_elevated_cache(cache_key, True, now)
+                        return True
+            _store_elevated_cache(cache_key, False, now)
+            return False
         finally:
             kernel32.CloseHandle(token)
     finally:
@@ -1332,9 +1356,10 @@ def activate_existing_window(title: str) -> bool:
             return True
     hwnd = _find_tk_window_by_title_prefix(title)
     if not hwnd:
-        return bool(tray_hwnd)
+        return False
     _allow_foreground_for_hwnd(hwnd)
-    user32.ShowWindow(hwnd, SW_RESTORE)
+    if user32.IsIconic(wintypes.HWND(hwnd)):
+        user32.ShowWindow(hwnd, SW_RESTORE)
     user32.SetForegroundWindow(hwnd)
     return True
 
@@ -1416,6 +1441,12 @@ def window_contains_point(hwnd: int, x: int, y: int) -> bool:
     return int(rect.left) <= x <= int(rect.right) and int(rect.top) <= y <= int(rect.bottom)
 
 
+def _primary_screen_size() -> tuple[int, int]:
+    w = int(user32.GetSystemMetrics(SM_CXSCREEN) or 0)
+    h = int(user32.GetSystemMetrics(SM_CYSCREEN) or 0)
+    return (w if w > 0 else 1920), (h if h > 0 else 1080)
+
+
 def monitor_work_area(hwnd: int = 0) -> tuple[int, int, int, int]:
     """Return (left, top, right, bottom) of the work area for the window's monitor."""
     target = root_window_hwnd(hwnd) if hwnd else 0
@@ -1430,22 +1461,27 @@ def monitor_work_area(hwnd: int = 0) -> tuple[int, int, int, int]:
         if user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
             work = info.rcWork
             return int(work.left), int(work.top), int(work.right), int(work.bottom)
-    return 0, 0, 1920, 1080
+    w, h = _primary_screen_size()
+    return 0, 0, w, h
 
 
 def clamp_to_monitor_work_area(x: int, y: int, width: int, height: int) -> tuple[int, int]:
     point = POINT(x + width // 2, y + height // 2)
     monitor = user32.MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST)
     if not monitor:
-        return max(4, x), max(4, y)
+        return x, y
     info = MONITORINFO()
     info.cbSize = ctypes.sizeof(info)
     if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
-        return max(4, x), max(4, y)
+        return x, y
     work = info.rcWork
     clamped_x = max(int(work.left) + 4, min(x, int(work.right) - width - 4))
     clamped_y = max(int(work.top) + 4, min(y, int(work.bottom) - height - 4))
     return clamped_x, clamped_y
+
+
+def _is_valid_caret_rect(rc: RECT) -> bool:
+    return not (rc.left == 0 and rc.top == 0 and rc.right == 0 and rc.bottom == 0)
 
 
 def has_hardware_caret(hwnd: int) -> bool:
@@ -1457,8 +1493,10 @@ def has_hardware_caret(hwnd: int) -> bool:
     info.cbSize = ctypes.sizeof(info)
     if not (user32.GetGUIThreadInfo(thread_id, ctypes.byref(info)) and info.hwndCaret):
         return False
+    if not _is_valid_caret_rect(info.rcCaret):
+        return False
     point = POINT(info.rcCaret.left, info.rcCaret.bottom)
-    return bool(user32.ClientToScreen(info.hwndCaret, ctypes.byref(point)) and (point.x or point.y))
+    return bool(user32.ClientToScreen(info.hwndCaret, ctypes.byref(point)))
 
 
 def text_cursor_position(
@@ -1467,17 +1505,21 @@ def text_cursor_position(
 ) -> tuple[int, int, int, int, int, int] | None:
     """Return caret x/y and its monitor bounds, falling back to anchor/mouse."""
     point = POINT()
+    caret_found = False
     process_id = wintypes.DWORD()
     thread_id = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id)) if hwnd else 0
     if thread_id:
         info = GUITHREADINFO()
         info.cbSize = ctypes.sizeof(info)
-        if user32.GetGUIThreadInfo(thread_id, ctypes.byref(info)) and info.hwndCaret:
+        if (
+            user32.GetGUIThreadInfo(thread_id, ctypes.byref(info))
+            and info.hwndCaret
+            and _is_valid_caret_rect(info.rcCaret)
+        ):
             point.x = info.rcCaret.left
             point.y = info.rcCaret.bottom
-            if not user32.ClientToScreen(info.hwndCaret, ctypes.byref(point)):
-                point.x = point.y = 0
-    if not (point.x or point.y):
+            caret_found = bool(user32.ClientToScreen(info.hwndCaret, ctypes.byref(point)))
+    if not caret_found:
         if fallback_point is not None and window_contains_point(hwnd, fallback_point[0], fallback_point[1]):
             point.x, point.y = fallback_point[0], fallback_point[1]
         elif not user32.GetCursorPos(ctypes.byref(point)):
@@ -1485,11 +1527,13 @@ def text_cursor_position(
 
     monitor = user32.MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST)
     if not monitor:
-        return int(point.x), int(point.y), 0, 0, 1920, 1080
+        w, h = _primary_screen_size()
+        return int(point.x), int(point.y), 0, 0, w, h
     info = MONITORINFO()
     info.cbSize = ctypes.sizeof(info)
     if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
-        return int(point.x), int(point.y), 0, 0, 1920, 1080
+        w, h = _primary_screen_size()
+        return int(point.x), int(point.y), 0, 0, w, h
     rect = info.rcWork
     return int(point.x), int(point.y), int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
 
@@ -1507,7 +1551,7 @@ def position_popup_no_activate(hwnd: int, x: int, y: int, width: int, height: in
         y,
         width,
         height,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
     ):
         raise ctypes.WinError(ctypes.get_last_error())
 
@@ -1518,6 +1562,15 @@ def make_popup_no_activate(hwnd: int) -> None:
         return
     style = int(_get_window_long(target, GWL_EXSTYLE))
     _set_window_long(target, GWL_EXSTYLE, style | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
+    user32.SetWindowPos(
+        target,
+        0,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+    )
 
 
 def taskbar_toggle_position(anchor_hwnd: int, width: int, height: int) -> tuple[int, int]:
@@ -1533,12 +1586,14 @@ def taskbar_toggle_position(anchor_hwnd: int, width: int, height: int) -> tuple[
 
     monitor = user32.MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST)
     if not monitor:
-        return 1920 - width - 360, 1080 - height - 56
+        w, h = _primary_screen_size()
+        return max(4, w - width - 360), max(4, h - height - 56)
 
     info = MONITORINFO()
     info.cbSize = ctypes.sizeof(info)
     if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
-        return 1920 - width - 360, 1080 - height - 56
+        w, h = _primary_screen_size()
+        return max(4, w - width - 360), max(4, h - height - 56)
 
     screen = info.rcMonitor
     work = info.rcWork
@@ -1595,10 +1650,11 @@ def _ensure_shift_released() -> None:
             for shift_vk in (VK_LSHIFT, VK_RSHIFT):
                 if user32.GetAsyncKeyState(shift_vk) & 0x8000:
                     scan = int(user32.MapVirtualKeyW(shift_vk, 0) or 0)
+                    ext = KEYEVENTF_EXTENDEDKEY if shift_vk == VK_RSHIFT else 0
                     inputs.append(
                         INPUT(
                             type=INPUT_KEYBOARD,
-                            ki=KEYBDINPUT(shift_vk, scan, KEYEVENTF_KEYUP, 0, APP_INJECTION_TAG),
+                            ki=KEYBDINPUT(shift_vk, scan, ext | KEYEVENTF_KEYUP, 0, APP_INJECTION_TAG),
                         )
                     )
             if inputs:
@@ -1606,6 +1662,44 @@ def _ensure_shift_released() -> None:
                 time.sleep(0.004)
             return
         time.sleep(0.005)
+
+
+def _split_grapheme_clusters(text: str) -> list[str]:
+    """Split text into approximate user-perceived grapheme clusters (combining/ZWJ/VS/flags)."""
+    if not text:
+        return []
+    clusters: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        start = index
+        ch = text[index]
+        code = ord(ch)
+        index += 1
+        # Pair Regional Indicator symbols (country flags).
+        if 0x1F1E6 <= code <= 0x1F1FF and index < length:
+            next_code = ord(text[index])
+            if 0x1F1E6 <= next_code <= 0x1F1FF:
+                index += 1
+        while index < length:
+            nxt = text[index]
+            nxt_code = ord(nxt)
+            if nxt_code == 0x200D:  # Zero-Width Joiner
+                index += 1
+                if index < length:
+                    index += 1
+                continue
+            if (
+                nxt_code in (0xFE0E, 0xFE0F, 0x20E3)
+                or (0x1F3FB <= nxt_code <= 0x1F3FF)
+                or (0xE0020 <= nxt_code <= 0xE007F)
+                or unicodedata.category(nxt) in ("Mn", "Mc", "Me")
+            ):
+                index += 1
+                continue
+            break
+        clusters.append(text[start:index])
+    return clusters
 
 
 def send_backspaces(count: int) -> None:
@@ -1632,12 +1726,14 @@ def send_backspaces(count: int) -> None:
 def replace_unicode_text(old_text: str, new_text: str) -> None:
     if old_text == new_text:
         return
+    old_clusters = _split_grapheme_clusters(old_text)
+    new_clusters = _split_grapheme_clusters(new_text)
     common = 0
-    limit = min(len(old_text), len(new_text))
-    while common < limit and old_text[common] == new_text[common]:
+    limit = min(len(old_clusters), len(new_clusters))
+    while common < limit and old_clusters[common] == new_clusters[common]:
         common += 1
-    backspaces = len(old_text) - common
-    suffix = new_text[common:]
+    backspaces = len(old_clusters) - common
+    suffix = "".join(new_clusters[common:])
     if backspaces > 0:
         send_backspaces(backspaces)
         if suffix:
@@ -1661,13 +1757,14 @@ def sync_unicode_text(
     new_pos = new_len + clamped_new
 
     if old_text == new_text:
-        delta = new_pos - old_pos
-        if delta != 0:
+        if old_pos != new_pos:
             _ensure_shift_released()
-            if delta < 0:
-                send_virtual_keys(VK_LEFT, -delta)
+            if new_pos < old_pos:
+                steps = len(_split_grapheme_clusters(old_text[new_pos:old_pos]))
+                send_virtual_keys(VK_LEFT, steps)
             else:
-                send_virtual_keys(VK_RIGHT, delta)
+                steps = len(_split_grapheme_clusters(old_text[old_pos:new_pos]))
+                send_virtual_keys(VK_RIGHT, steps)
         return
 
     old_left = old_text[:old_pos]
@@ -1685,18 +1782,19 @@ def sync_unicode_text(
         and old_right.endswith(new_right)
     ):
         _ensure_shift_released()
-        send_virtual_keys(VK_DELETE, len(old_right) - len(new_right))
+        deleted = old_right[: len(old_right) - len(new_right)]
+        send_virtual_keys(VK_DELETE, len(_split_grapheme_clusters(deleted)))
         return
 
     if clamped_old < 0:
         _ensure_shift_released()
-        send_virtual_keys(VK_RIGHT, -clamped_old)
+        send_virtual_keys(VK_RIGHT, len(_split_grapheme_clusters(old_right)))
         time.sleep(0.006)
     replace_unicode_text(old_text, new_text)
     if clamped_new < 0:
         time.sleep(0.006)
         _ensure_shift_released()
-        send_virtual_keys(VK_LEFT, -clamped_new)
+        send_virtual_keys(VK_LEFT, len(_split_grapheme_clusters(new_right)))
 
 
 def send_unicode_text(text: str) -> None:
@@ -1727,10 +1825,17 @@ def send_unicode_text(text: str) -> None:
 
 
 def _send_inputs(inputs: list[INPUT]) -> None:
+    if not inputs:
+        return
     array_type = INPUT * len(inputs)
     sent = user32.SendInput(len(inputs), array_type(*inputs), ctypes.sizeof(INPUT))
     if sent != len(inputs):
-        raise ctypes.WinError(ctypes.get_last_error())
+        err = ctypes.get_last_error()
+        if err:
+            raise ctypes.WinError(err)
+        raise PermissionError(
+            f"SendInput was blocked (sent {sent}/{len(inputs)}; possible UIPI or elevated foreground window)"
+        )
 
 
 _HOOK_WAIT_TIMEOUT = 0.22
@@ -1960,14 +2065,24 @@ class KeyboardHook:
             self.selecting.set()
             return seq
 
+    def _clear_swallowed(self) -> None:
+        with self._swallowed_lock:
+            self._swallowed.clear()
+
     def start(self) -> None:
-        if self._thread is not None:
+        if self._thread is not None and self._thread.is_alive():
             return
+        self._ready.clear()
+        self._stopped.clear()
+        self._startup_error = None
+        self._thread_id = 0
+        self._clear_swallowed()
         self._thread = threading.Thread(target=self._message_loop, name="AzooKey keyboard hook", daemon=True)
         self._thread.start()
         if not self._ready.wait(timeout=5):
             raise RuntimeError("Windows のキーボードフックを開始できませんでした。")
         if self._startup_error is not None:
+            self._thread = None
             raise RuntimeError(f"Windows のキーボードフックを開始できません: {self._startup_error}")
 
     def set_active(self, enabled: bool) -> None:
@@ -2082,7 +2197,8 @@ class KeyboardHook:
                 self.selecting.clear()
 
     def stop(self) -> None:
-        if self._thread is None:
+        thread = self._thread
+        if thread is None:
             return
         with self._state_lock:
             self.active.clear()
@@ -2092,10 +2208,13 @@ class KeyboardHook:
             self._pending_passthrough_restore = None
             self._suppress_commit_tokens.clear()
             self._clear_composing_locked()
+        self._clear_swallowed()
         if self._thread_id:
             user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
-        self._thread.join(timeout=2)
-        self._thread = None
+        thread.join(timeout=2)
+        if not thread.is_alive():
+            self._thread = None
+            self._thread_id = 0
 
     def _message_loop(self) -> None:
         self._thread_id = int(kernel32.GetCurrentThreadId())
@@ -2239,16 +2358,16 @@ class KeyboardHook:
 
             hwnd = foreground_window()
             process_id = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
-            own_process = process_id.value == os.getpid()
+            if hwnd:
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+            own_process = bool(hwnd) and process_id.value == os.getpid()
 
-            if not own_process:
-                with self._state_lock:
+            with self._state_lock:
+                if not own_process:
                     detach_seq = self.try_detach_composing(if_fg_differs=hwnd)
                     if detach_seq is not None:
                         self.events.put(InputEvent("detach_commit", hwnd, seq=detach_seq))
-
-            bridge_enabled = self.active.is_set() or self.english.is_set()
+                bridge_enabled = self.active.is_set() or self.english.is_set()
             no_sys_modifiers = not self._modifier_pressed(VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN)
             alt_only = (
                 self._modifier_pressed(VK_MENU)
@@ -2404,7 +2523,7 @@ class KeyboardHook:
 
             if vk in _SYMBOL_AND_DIGIT_VKS:
                 raw_ascii = self._translate_ascii_symbol_or_digit(vk, int(event.scanCode), hwnd)
-                char = self._translate_japanese_symbol_or_digit(vk, int(event.scanCode), hwnd)
+                char = self._translate_japanese_symbol_or_digit(vk, int(event.scanCode), hwnd, raw_ascii=raw_ascii)
                 if char:
                     dispatch_mode = "letter"
                     auto_commit_done: threading.Event | None = None
@@ -2707,15 +2826,6 @@ class KeyboardHook:
                 return result
         return user32.CallNextHookEx(self._hook, code, message, pointer)
 
-    def _send_english_character(self, hwnd: int, vk: int, char: str) -> None:
-        completed = threading.Event()
-        self.events.put(InputEvent("english", hwnd, char, completed))
-        self._swallow(vk)
-        # English characters are sent asynchronously by the worker; wait briefly
-        # so later spaces, punctuation, and keys cannot overtake them, while
-        # preserving english mode if the worker takes longer than 220ms.
-        completed.wait(timeout=_HOOK_WAIT_TIMEOUT)
-
     @staticmethod
     def _modifier_pressed(*keys: int) -> bool:
         return any(user32.GetAsyncKeyState(key) & 0x8000 for key in keys)
@@ -2738,10 +2848,11 @@ class KeyboardHook:
     def _translate_letter(vk: int, scan_code: int, hwnd: int, *, respect_caps: bool = True) -> str:
         state = KeyboardHook._keyboard_state()
         process_id = wintypes.DWORD()
-        thread_id = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+        thread_id = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id)) if hwnd else 0
         layout = user32.GetKeyboardLayout(thread_id)
         output = (wintypes.WCHAR * 8)()
-        count = user32.ToUnicodeEx(vk, scan_code, state, output, len(output), 0, layout)
+        # Flag 0x4 (Windows 10 1607+) avoids mutating kernel dead-key state.
+        count = user32.ToUnicodeEx(vk, scan_code, state, output, len(output), 0x4, layout)
         shifted = bool(user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
         caps_lock = bool(user32.GetKeyState(VK_CAPITAL) & 1) if respect_caps else False
         uppercase = shifted ^ caps_lock
@@ -2763,10 +2874,10 @@ class KeyboardHook:
         if vk in _SYMBOL_AND_DIGIT_VKS:
             state = KeyboardHook._keyboard_state()
             process_id = wintypes.DWORD()
-            thread_id = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+            thread_id = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id)) if hwnd else 0
             layout = user32.GetKeyboardLayout(thread_id)
             output = (wintypes.WCHAR * 8)()
-            count = user32.ToUnicodeEx(vk, scan_code, state, output, len(output), 0, layout)
+            count = user32.ToUnicodeEx(vk, scan_code, state, output, len(output), 0x4, layout)
             if count == 1:
                 char = output[0]
                 if char.isascii() and char.isprintable():
@@ -2774,10 +2885,20 @@ class KeyboardHook:
         return ""
 
     @staticmethod
-    def _translate_japanese_symbol_or_digit(vk: int, scan_code: int, hwnd: int) -> str:
+    def _translate_japanese_symbol_or_digit(
+        vk: int,
+        scan_code: int,
+        hwnd: int,
+        *,
+        raw_ascii: str | None = None,
+    ) -> str:
+        char = (
+            raw_ascii
+            if raw_ascii is not None
+            else KeyboardHook._translate_ascii_symbol_or_digit(vk, scan_code, hwnd)
+        )
         if vk in _NUMPAD_VKS:
-            return KeyboardHook._translate_ascii_symbol_or_digit(vk, scan_code, hwnd)
-        char = KeyboardHook._translate_ascii_symbol_or_digit(vk, scan_code, hwnd)
+            return char
         if not char:
             return ""
         if char in JAPANESE_SYMBOL_MAP:
@@ -2795,65 +2916,99 @@ class KeyboardHook:
         return KeyboardHook._translate_ascii_symbol_or_digit(vk, scan_code, hwnd)
 
 
+def _truncate_utf16(text: str, max_units: int = 127) -> str:
+    """Truncate text so its UTF-16 code unit length never exceeds max_units."""
+    if not text:
+        return ""
+    units = 0
+    end = 0
+    for index, ch in enumerate(text):
+        need = 2 if ord(ch) > 0xFFFF else 1
+        if units + need > max_units:
+            break
+        units += need
+        end = index + 1
+    return text[:end]
+
+
 def _create_tray_badge_icon(glyph: str, rgb: tuple[int, int, int]) -> int:
     """Create a 32x32 Win32 HICON badge using pure GDI (no external .ico asset)."""
     size = 32
     dc = gdi32.CreateCompatibleDC(None)
     mask_dc = gdi32.CreateCompatibleDC(None)
-    bmi = BITMAPINFOHEADER()
-    bmi.biSize = ctypes.sizeof(bmi)
-    bmi.biWidth = size
-    bmi.biHeight = -size
-    bmi.biPlanes = 1
-    bmi.biBitCount = 24
-    bits = ctypes.c_void_p()
-    hbmp = gdi32.CreateDIBSection(dc, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
-    hmask = gdi32.CreateBitmap(size, size, 1, 1, None)
-    if not dc or not mask_dc or not hbmp or not hmask:
-        for obj in (hbmp, hmask):
+    hbmp = 0
+    hmask = 0
+    bg_brush = 0
+    font = 0
+    opaque_brush = 0
+    old_bmp = 0
+    old_mask = 0
+    old_font = 0
+    try:
+        if not dc or not mask_dc:
+            return 0
+        bmi = BITMAPINFOHEADER()
+        bmi.biSize = ctypes.sizeof(bmi)
+        bmi.biWidth = size
+        bmi.biHeight = -size
+        bmi.biPlanes = 1
+        bmi.biBitCount = 24
+        bits = ctypes.c_void_p()
+        hbmp = gdi32.CreateDIBSection(dc, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
+        hmask = gdi32.CreateBitmap(size, size, 1, 1, None)
+        if not hbmp or not hmask:
+            return 0
+
+        old_bmp = gdi32.SelectObject(dc, hbmp)
+        old_mask = gdi32.SelectObject(mask_dc, hmask)
+        rect = RECT(0, 0, size, size)
+
+        colorref = rgb[0] | (rgb[1] << 8) | (rgb[2] << 16)
+        bg_brush = gdi32.CreateSolidBrush(colorref)
+        if bg_brush:
+            user32.FillRect(dc, ctypes.byref(rect), bg_brush)
+
+        lf = LOGFONTW()
+        lf.lfHeight = -22
+        lf.lfWeight = 700
+        lf.lfCharSet = 1
+        lf.lfFaceName = "Yu Gothic UI"
+        font = gdi32.CreateFontIndirectW(ctypes.byref(lf))
+        if font:
+            old_font = gdi32.SelectObject(dc, font)
+        gdi32.SetBkMode(dc, TRANSPARENT)
+        gdi32.SetTextColor(dc, 0x00FFFFFF)
+        user32.DrawTextW(dc, glyph, -1, ctypes.byref(rect), DT_CENTER | DT_VCENTER | DT_SINGLELINE)
+        if old_font:
+            gdi32.SelectObject(dc, old_font)
+            old_font = 0
+
+        opaque_brush = gdi32.CreateSolidBrush(0x00000000)
+        if opaque_brush:
+            user32.FillRect(mask_dc, ctypes.byref(rect), opaque_brush)
+
+        if old_bmp:
+            gdi32.SelectObject(dc, old_bmp)
+            old_bmp = 0
+        if old_mask:
+            gdi32.SelectObject(mask_dc, old_mask)
+            old_mask = 0
+
+        info = ICONINFO(fIcon=True, xHotspot=0, yHotspot=0, hbmMask=hmask, hbmColor=hbmp)
+        return int(user32.CreateIconIndirect(ctypes.byref(info)) or 0)
+    finally:
+        if old_font and dc:
+            gdi32.SelectObject(dc, old_font)
+        if old_bmp and dc:
+            gdi32.SelectObject(dc, old_bmp)
+        if old_mask and mask_dc:
+            gdi32.SelectObject(mask_dc, old_mask)
+        for obj in (font, bg_brush, opaque_brush, hbmp, hmask):
             if obj:
                 gdi32.DeleteObject(obj)
         for hdc in (dc, mask_dc):
             if hdc:
                 gdi32.DeleteDC(hdc)
-        return 0
-
-    old_bmp = gdi32.SelectObject(dc, hbmp)
-    old_mask = gdi32.SelectObject(mask_dc, hmask)
-    rect = RECT(0, 0, size, size)
-
-    colorref = rgb[0] | (rgb[1] << 8) | (rgb[2] << 16)
-    bg_brush = gdi32.CreateSolidBrush(colorref)
-    user32.FillRect(dc, ctypes.byref(rect), bg_brush)
-    gdi32.DeleteObject(bg_brush)
-
-    lf = LOGFONTW()
-    lf.lfHeight = -22
-    lf.lfWeight = 700
-    lf.lfCharSet = 1
-    lf.lfFaceName = "Yu Gothic UI"
-    font = gdi32.CreateFontIndirectW(ctypes.byref(lf))
-    old_font = gdi32.SelectObject(dc, font)
-    gdi32.SetBkMode(dc, TRANSPARENT)
-    gdi32.SetTextColor(dc, 0x00FFFFFF)
-    user32.DrawTextW(dc, glyph, -1, ctypes.byref(rect), DT_CENTER | DT_VCENTER | DT_SINGLELINE)
-    gdi32.SelectObject(dc, old_font)
-    gdi32.DeleteObject(font)
-
-    opaque_brush = gdi32.CreateSolidBrush(0x00000000)
-    user32.FillRect(mask_dc, ctypes.byref(rect), opaque_brush)
-    gdi32.DeleteObject(opaque_brush)
-
-    gdi32.SelectObject(dc, old_bmp)
-    gdi32.SelectObject(mask_dc, old_mask)
-    gdi32.DeleteDC(dc)
-    gdi32.DeleteDC(mask_dc)
-
-    info = ICONINFO(fIcon=True, xHotspot=0, yHotspot=0, hbmMask=hmask, hbmColor=hbmp)
-    hicon = int(user32.CreateIconIndirect(ctypes.byref(info)) or 0)
-    gdi32.DeleteObject(hbmp)
-    gdi32.DeleteObject(hmask)
-    return hicon
 
 
 class SystemTrayIcon:
@@ -2880,8 +3035,11 @@ class SystemTrayIcon:
         self._wnd_proc_ref = WNDPROC(self._wnd_proc)
 
     def start(self) -> bool:
-        if self._thread is not None:
+        if self._thread is not None and self._thread.is_alive():
             return self.active
+        with self._lock:
+            self._closing = False
+        self._ready.clear()
         self._thread = threading.Thread(target=self._run, name="AzooKey tray icon", daemon=True)
         self._thread.start()
         self._ready.wait(timeout=2.0)
@@ -2891,7 +3049,7 @@ class SystemTrayIcon:
         with self._lock:
             self._state = state
             self._enabled = enabled
-            self._tooltip = (tooltip or "AzooKey Live Bridge")[:127]
+            self._tooltip = _truncate_utf16(tooltip or "AzooKey Live Bridge", 127)
             hwnd = self._hwnd
         if hwnd and user32.IsWindow(hwnd):
             user32.PostMessageW(hwnd, WM_TRAY_UPDATE, 0, 0)
@@ -2907,7 +3065,8 @@ class SystemTrayIcon:
             user32.PostMessageW(hwnd, WM_CANCELMODE, 0, 0)
             user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
         thread.join(timeout=2.0)
-        self._thread = None
+        if not thread.is_alive():
+            self._thread = None
         self.active = False
 
     def _build_icons(self) -> None:
@@ -2940,7 +3099,7 @@ class SystemTrayIcon:
             uFlags=NIF_MESSAGE | NIF_ICON | NIF_TIP,
             uCallbackMessage=WM_TRAY_CALLBACK,
             hIcon=hicon,
-            szTip=tip[:127],
+            szTip=_truncate_utf16(tip, 127),
         )
 
     def _add_or_modify_icon(self, hwnd: int, *, add: bool) -> bool:
@@ -3049,6 +3208,10 @@ class SystemTrayIcon:
             lpszClassName=_TRAY_CLASS_NAME,
         )
         atom = user32.RegisterClassExW(ctypes.byref(wc))
+        if not atom and ctypes.get_last_error() == ERROR_CLASS_ALREADY_EXISTS:
+            user32.UnregisterClassW(_TRAY_CLASS_NAME, hinst)
+            atom = user32.RegisterClassExW(ctypes.byref(wc))
+        registered_class = bool(atom)
         if not atom:
             self._ready.set()
             return
@@ -3074,11 +3237,11 @@ class SystemTrayIcon:
             )
             with self._lock:
                 self._hwnd = hwnd
-            if hwnd:
-                self.active = self._add_or_modify_icon(hwnd, add=True)
-            self._ready.set()
-            if not hwnd:
+                closing = self._closing
+            if not hwnd or closing:
                 return
+            self.active = self._add_or_modify_icon(hwnd, add=True)
+            self._ready.set()
             msg = MSG()
             while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
                 user32.TranslateMessage(ctypes.byref(msg))
@@ -3092,4 +3255,6 @@ class SystemTrayIcon:
                 self._hwnd = 0
             self.active = False
             self._destroy_icons()
-            user32.UnregisterClassW(_TRAY_CLASS_NAME, hinst)
+            if registered_class:
+                user32.UnregisterClassW(_TRAY_CLASS_NAME, hinst)
+            self._ready.set()

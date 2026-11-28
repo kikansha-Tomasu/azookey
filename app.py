@@ -83,7 +83,7 @@ _HALFWIDTH_KATAKANA_MAP: dict[str, str] = {
     "ヘ": "ﾍ", "ベ": "ﾍﾞ", "ペ": "ﾍﾟ", "ホ": "ﾎ", "ボ": "ﾎﾞ", "ポ": "ﾎﾟ",
     "マ": "ﾏ", "ミ": "ﾐ", "ム": "ﾑ", "メ": "ﾒ", "モ": "ﾓ",
     "ャ": "ｬ", "ヤ": "ﾔ", "ュ": "ｭ", "ユ": "ﾕ", "ョ": "ｮ", "ヨ": "ﾖ",
-    "ラ": "ﾗ", "リル"[0]: "ﾘ", "ル": "ﾙ", "レ": "ﾚ", "ロ": "ﾛ",
+    "ラ": "ﾗ", "リ": "ﾘ", "ル": "ﾙ", "レ": "ﾚ", "ロ": "ﾛ",
     "ヮ": "ﾜ", "ワ": "ﾜ", "ヰ": "ｲ", "ヱ": "ｴ", "ヲ": "ｦ", "ン": "ﾝ", "ヴ": "ｳﾞ",
     "ー": "ｰ", "、": "､", "。": "｡", "「": "｢", "」": "｣", "・": "･",
 }
@@ -197,8 +197,8 @@ UI_SCALES: dict[str, dict[str, int]] = {
     },
 }
 
-# Fixed integer initial position closest to the button's active screen placement.
-DEFAULT_TOGGLE_POSITION: tuple[int, int] = (2085, 1465)
+# Default to dynamic taskbar-relative placement (None -> taskbar_toggle_position).
+DEFAULT_TOGGLE_POSITION: tuple[int, int] | None = None
 
 
 def _draw_check_indicator_image(
@@ -281,17 +281,58 @@ def _draw_check_indicator_image(
 
 
 _BRIDGE_APPDATA_CACHE: tuple[str, str, Path] | None = None
+_SETTINGS_IO_LOCK = threading.Lock()
 
 
 def _dir_writable(path: Path) -> bool:
     try:
         path.mkdir(parents=True, exist_ok=True)
-        probe = path / ".write_probe"
+        probe = path / f".write_probe.{os.getpid()}.{threading.get_ident()}"
         probe.write_text("", encoding="utf-8")
         probe.unlink(missing_ok=True)
         return True
     except OSError:
         return False
+
+
+def _write_json_atomic(target: Path, payload: object) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    content = json.dumps(payload, ensure_ascii=False, indent=2)
+    try:
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_path, target)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _read_json_dict_safe(target: Path) -> dict:
+    try:
+        raw = target.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        data = None
+    if isinstance(data, dict):
+        return data
+    # Preserve corrupted or unexpected JSON for recovery instead of silently overwriting it later.
+    try:
+        backup = target.with_name(f"{target.name}.corrupt.{time.time_ns()}")
+        os.replace(target, backup)
+    except OSError:
+        pass
+    return {}
 
 
 def _default_engine_dir() -> str:
@@ -320,12 +361,8 @@ def _settings_path() -> Path:
 
 
 def _load_settings() -> dict[str, str]:
-    try:
-        data = json.loads(_settings_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
+    with _SETTINGS_IO_LOCK:
+        data = _read_json_dict_safe(_settings_path())
     engine_dir = str(data.get("engine_dir", ""))
     if not engine_dir or not (Path(engine_dir) / "azookey-server.dll").is_file():
         engine_dir = _default_engine_dir()
@@ -362,13 +399,13 @@ def _load_settings() -> dict[str, str]:
 
 def _save_settings(settings: dict[str, str]) -> None:
     target = _settings_path()
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError:
-        # Settings persistence is optional; an unwritable profile must not
-        # prevent the keyboard hook and live conversion from becoming active.
-        pass
+    with _SETTINGS_IO_LOCK:
+        try:
+            _write_json_atomic(target, settings)
+        except OSError:
+            # Settings persistence is optional; an unwritable profile must not
+            # prevent the keyboard hook and live conversion from becoming active.
+            pass
 
 
 _LEARNING_IO_LOCK = threading.Lock()
@@ -380,12 +417,7 @@ def _learning_path() -> Path:
 
 def _load_learning_memory() -> dict[str, str]:
     with _LEARNING_IO_LOCK:
-        try:
-            data = json.loads(_learning_path().read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
-            return {}
-    if not isinstance(data, dict):
-        return {}
+        data = _read_json_dict_safe(_learning_path())
     cleaned: dict[str, str] = {}
     for key, value in list(data.items())[-_LEARNING_LIMIT:]:
         if isinstance(key, str) and isinstance(value, str) and key and value:
@@ -398,8 +430,7 @@ def _save_learning_memory(memory: dict[str, str]) -> None:
     with _LEARNING_IO_LOCK:
         try:
             trimmed = dict(list(memory.items())[-_LEARNING_LIMIT:])
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(json.dumps(trimmed, ensure_ascii=False, indent=2), encoding="utf-8")
+            _write_json_atomic(target, trimmed)
         except OSError:
             pass
 
@@ -550,6 +581,14 @@ class CompositionWorker:
         except Exception:
             pass
 
+    @property
+    def target_hwnd(self) -> int:
+        return self._target
+
+    def learning_count(self) -> int:
+        with self._learning_lock:
+            return len(self._learning_memory)
+
     def learning_items(self) -> list[tuple[str, str]]:
         """Return learned (reading, candidate) pairs ordered oldest to newest."""
         with self._learning_lock:
@@ -577,9 +616,12 @@ class CompositionWorker:
         if not reading or not chosen or len(reading) > 24 or _has_incomplete_romaji(reading):
             return
         with self._learning_lock:
-            if self._learning_memory.get(reading) == chosen:
-                self._learning_memory.pop(reading, None)
-                self._learning_memory[reading] = chosen
+            already_latest = (
+                bool(self._learning_memory)
+                and self._learning_memory.get(reading) == chosen
+                and next(reversed(self._learning_memory)) == reading
+            )
+            if already_latest:
                 return
             self._learning_memory.pop(reading, None)
             self._learning_memory[reading] = chosen
@@ -1121,21 +1163,7 @@ class CompositionWorker:
             self._sync_editor_display(hwnd, selected, 0)
         self._update_context(selected)
         self.client.clear_text()
-        self._hiragana = ""
-        self._raw_input = ""
-        self._segments.clear()
-        self._cursor_offset = 0
-        self._displayed_text = ""
-        self._displayed_cursor = 0
-        self._stable_prefix_text = ""
-        self._stable_kana_prefix = ""
-        self._needs_compose = False
-        self._suggestions = ()
-        self._engine_suggestion_texts.clear()
-        self._candidates = ()
-        self._candidate_index = 0
-        self._selecting = False
-        self._ascii_direct = False
+        self._reset_state(reset_hook=False, clear_ui=False, keep_target=True)
         if reset_hook:
             self.hook.mark_ascii_direct(False, seq=self._active_event_seq)
         self.hook.mark_selecting(False, seq=self._active_event_seq)
@@ -1235,12 +1263,13 @@ class CompositionWorker:
             self._restore_hook_selection()
             return
         if event.kind == "transliterate":
-            self._finalize_trailing_n()
-            if self._clear_if_empty():
-                return
             mode = event.char
             if self._ascii_direct and mode in ("f6", "f7", "f8"):
                 self.hook.mark_selecting(self._selecting, seq=self._active_event_seq)
+                return
+            self._move_cursor_to_end_raw()
+            self._finalize_trailing_n()
+            if self._clear_if_empty():
                 return
             if mode == "f6":
                 converted = _to_hiragana(self._hiragana)
@@ -1824,16 +1853,18 @@ class CompositionWorker:
         self.client.clear_text()
         self._reset_state(reset_hook=reset_hook)
 
-    def _selected_text(self) -> str:
-        if self._candidates and 0 <= self._candidate_index < len(self._candidates):
-            return self._candidates[self._candidate_index]
-        return self._hiragana
-
     def _selected_full_text(self) -> str:
         return self._editor_text_for_index(self._candidate_index)
 
-    def _reset_state(self, *, reset_hook: bool = True) -> None:
-        self._target = 0
+    def _reset_state(
+        self,
+        *,
+        reset_hook: bool = True,
+        clear_ui: bool = True,
+        keep_target: bool = False,
+    ) -> None:
+        if not keep_target:
+            self._target = 0
         self._hiragana = ""
         self._raw_input = ""
         self._segments.clear()
@@ -1859,8 +1890,9 @@ class CompositionWorker:
                 self.hook.mark_ascii_direct(False)
                 self.hook.mark_selecting(False)
                 self.hook.mark_composing(False)
-        self.ui_events.put(("preview", ""))
-        self.ui_events.put(("candidate_popup", None))
+        if clear_ui:
+            self.ui_events.put(("preview", ""))
+            self.ui_events.put(("candidate_popup", None))
 
     def _sync_unselected_popup(self, hwnd: int) -> None:
         if self._ascii_direct and self._raw_input:
@@ -2121,15 +2153,16 @@ class CandidatePopup:
             min_width,
             min(max_width, self.window.winfo_reqwidth()),
         )
-        height = self.window.winfo_reqheight()
+        max_height = max(120, bottom - top - 16)
+        height = min(max_height, self.window.winfo_reqheight())
         x = caret_x + 2
         y = caret_y + 5
         if y + height > bottom - 4:
-            y = caret_y - height - 6
+            y = caret_y - height - _scale_px(24, dpi)
         if x + width > right - 4:
             x = right - width - 4
         x = max(left + 4, x)
-        y = max(top + 4, y)
+        y = max(top + 4, min(y, bottom - height - 4))
         self.window.geometry(_geometry_spec(width, height, x, y))
         self.window.deiconify()
         self.window.update_idletasks()
@@ -2156,6 +2189,13 @@ class CandidatePopup:
         self._last_args = None
         try:
             self.window.withdraw()
+        except tk.TclError:
+            pass
+
+    def close(self) -> None:
+        self.hide()
+        try:
+            self.window.destroy()
         except tk.TclError:
             pass
 
@@ -2475,6 +2515,7 @@ class AzooKeyLiveBridge:
         self._blocked_by_uipi = False
         self._last_toggle_signature: tuple[object, ...] | None = None
         self._last_tray_signature: tuple[object, ...] | None = None
+        self._last_status_badge_sig: tuple[str, str] | None = None
         self._last_settings_theme_sig: tuple[bool, bool, str, float] | None = None
         self._cached_os_theme_sig: tuple[bool, bool] | None = None
         self._cached_os_text_scale: float = 1.0
@@ -2512,12 +2553,17 @@ class AzooKeyLiveBridge:
         self._learning_sort_desc = True
         self._learning_iid_map: dict[str, tuple[int, str, str]] = {}
         self._learning_feedback_after_id: str | None = None
+        self._learning_search_after_id: str | None = None
 
         saved_scale = self.settings.get("ui_scale", "normal")
-        had_saved_toggle_pos = bool(
-            self.settings.get("toggle_x", "").strip()
-            or self.settings.get("toggle_y", "").strip()
-        )
+        saved_toggle_pos: tuple[int, int] | None = None
+        raw_tx = self.settings.get("toggle_x", "").strip()
+        raw_ty = self.settings.get("toggle_y", "").strip()
+        if raw_tx and raw_ty:
+            try:
+                saved_toggle_pos = (int(raw_tx), int(raw_ty))
+            except ValueError:
+                saved_toggle_pos = None
 
         self._build_ui(saved_scale)
         self.candidate_popup = CandidatePopup(
@@ -2531,7 +2577,7 @@ class AzooKeyLiveBridge:
             self._toggle,
             on_position_change=self._on_toggle_moved,
             anchor_resolver=self._toggle_anchor_hwnd,
-            custom_position=None,
+            custom_position=saved_toggle_pos,
             default_position=DEFAULT_TOGGLE_POSITION,
             scale=saved_scale,
         )
@@ -2539,8 +2585,6 @@ class AzooKeyLiveBridge:
         self.tray_icon.start()
         self._refresh_tray_controls()
         self._refresh_status_and_indicators(force=True)
-        if had_saved_toggle_pos:
-            self._persist_current_settings()
         self._poll_ui()
         if (
             self.settings.get("start_minimized", "0") == "1"
@@ -2553,12 +2597,13 @@ class AzooKeyLiveBridge:
             self._start()
 
     def _persist_current_settings(self) -> None:
+        custom_pos = self.corner_toggle.custom_position if hasattr(self, "corner_toggle") else None
         _save_settings(
             {
                 "engine_dir": self.engine_path.get().strip(),
                 "ui_scale": self.ui_scale_var.get(),
-                "toggle_x": "",
-                "toggle_y": "",
+                "toggle_x": str(int(custom_pos[0])) if custom_pos is not None else "",
+                "toggle_y": str(int(custom_pos[1])) if custom_pos is not None else "",
                 "english_passthrough": "1" if self.english_passthrough_var.get() else "0",
                 "fullwidth_space": "1" if self.fullwidth_space_var.get() else "0",
                 "shift_direct_english": "1" if self.shift_direct_english_var.get() else "0",
@@ -2582,10 +2627,6 @@ class AzooKeyLiveBridge:
             "indicator_px": _scale_px(round(raw["settings_indicator_px"] * text_scale), self._root_dpi),
             "pad": _scale_px(raw["settings_pad"], self._root_dpi),
         }
-
-    @staticmethod
-    def _set_button_label(button: ttk.Button, text: str) -> None:
-        button.configure(text=text, underline=-1)
 
     def _bind_focus_scroll(self, widget: tk.Widget) -> None:
         widget.bind("<FocusIn>", lambda _e, w=widget: self._ensure_widget_visible(w), add="+")
@@ -4251,6 +4292,10 @@ class AzooKeyLiveBridge:
             text, style = "● 日本語変換 ON", "BadgeOk.TLabel"
         else:
             text, style = "● 英語入力 OFF", "BadgeNeutral.TLabel"
+        badge_sig = (text, style)
+        if badge_sig == getattr(self, "_last_status_badge_sig", None):
+            return
+        self._last_status_badge_sig = badge_sig
         self.status_badge_var.set(text)
         try:
             self._status_badge_label.configure(style=style)
@@ -4321,7 +4366,7 @@ class AzooKeyLiveBridge:
         try:
             self.root.clipboard_clear()
             self.root.clipboard_append("\n".join(lines))
-            self.root.update()
+            self.root.update_idletasks()
             self._show_copy_feedback("✓ 状態と診断情報をクリップボードにコピーしました")
         except tk.TclError:
             self._show_copy_feedback("⚠ クリップボードへのコピーに失敗しました")
@@ -4604,8 +4649,16 @@ class AzooKeyLiveBridge:
         orig_appdata = preferred_appdata_dir()
         if orig_appdata:
             env["APPDATA"] = orig_appdata
+        cmd = (
+            [sys.executable]
+            if getattr(sys, "frozen", False)
+            else [sys.executable, str(Path(__file__).resolve())]
+        )
         self.close()
-        subprocess.Popen([sys.executable, str(Path(__file__).resolve())], env=env, close_fds=True)
+        try:
+            subprocess.Popen(cmd, env=env, close_fds=True)
+        except OSError:
+            pass
 
     def _on_fullwidth_space_changed(self) -> None:
         if self.hook:
@@ -4724,6 +4777,7 @@ class AzooKeyLiveBridge:
 
     def _close_learning_viewer(self) -> None:
         self._cancel_learning_feedback()
+        self._cancel_after_attr("_learning_search_after_id")
         win = self._learning_window
         self._learning_window = None
         self._learning_viewer_widgets.clear()
@@ -4958,7 +5012,7 @@ class AzooKeyLiveBridge:
         try:
             self.root.clipboard_clear()
             self.root.clipboard_append("\n".join(lines))
-            self.root.update()
+            self.root.update_idletasks()
             if len(selected) == 1:
                 _r, reading, candidate = selected[0]
                 self._show_learning_viewer_feedback(f"✓ 「{reading} → {candidate}」をコピーしました")
@@ -5057,7 +5111,15 @@ class AzooKeyLiveBridge:
             ),
         )
         clear_btn.grid(row=0, column=2, padx=(_scale_px(6, self._root_dpi), 0))
-        self._learning_search_var.trace_add("write", lambda *_: self._refresh_learning_viewer())
+
+        def _schedule_learning_search(*_args) -> None:
+            self._cancel_after_attr("_learning_search_after_id")
+            try:
+                self._learning_search_after_id = self.root.after(120, self._refresh_learning_viewer)
+            except tk.TclError:
+                self._refresh_learning_viewer()
+
+        self._learning_search_var.trace_add("write", _schedule_learning_search)
 
         # Row 1: Count & sort summary
         self._learning_summary_var = tk.StringVar(master=win, value="")
@@ -5161,7 +5223,15 @@ class AzooKeyLiveBridge:
         )
         tree.bind("<Return>", lambda _e: self._copy_selected_learning_entries())
 
-        win.bind("<Escape>", lambda _e: (self._close_learning_viewer(), "break")[-1])
+        def _on_viewer_escape(_e) -> str:
+            if self._learning_search_var is not None and self._learning_search_var.get():
+                self._learning_search_var.set("")
+                search_entry.focus_set()
+                return "break"
+            self._close_learning_viewer()
+            return "break"
+
+        win.bind("<Escape>", _on_viewer_escape)
         win.bind(
             "<F5>",
             lambda _e: (self._refresh_learning_viewer(), self._show_learning_viewer_feedback("✓ 学習履歴を再読込しました"), "break")[-1],
@@ -5204,8 +5274,9 @@ class AzooKeyLiveBridge:
         own = self._own_hwnds()
         if fg and fg not in own:
             return fg
-        if self.worker and self.worker._target and self.worker._target not in own:
-            return self.worker._target
+        worker_target = self.worker.target_hwnd if self.worker is not None else 0
+        if worker_target and worker_target not in own:
+            return worker_target
         return _top_window_hwnd(self.root)
 
     def _on_toggle_moved(self, _pos: tuple[int, int] | None) -> None:
@@ -5529,13 +5600,17 @@ class AzooKeyLiveBridge:
             self._last_os_theme_check = now
         theme_sig = self._cached_os_theme_sig
         text_scale = self._cached_os_text_scale
+        current_dpi = dpi_for_window(int(self.root.winfo_id()))
+        dpi_changed = current_dpi != self._root_dpi
+        if dpi_changed:
+            self._root_dpi = current_dpi
         settings_theme_sig = (
             theme_sig[0],
             theme_sig[1],
             self.ui_scale_var.get(),
             text_scale,
         )
-        if settings_theme_sig != self._last_settings_theme_sig:
+        if dpi_changed or settings_theme_sig != self._last_settings_theme_sig:
             self._apply_settings_theme(force_wrap=True)
             self.candidate_popup.set_scale(self.ui_scale_var.get())
         self._refresh_status_badge()
@@ -5547,6 +5622,7 @@ class AzooKeyLiveBridge:
             self.corner_toggle.custom_position,
             theme_sig,
             _text_scale_multiplier(text_scale),
+            self._root_dpi,
         )
         if force or getattr(self.corner_toggle, "_reposition_failed", False) or toggle_sig != self._last_toggle_signature:
             self.corner_toggle.update(enabled=self.enabled, available=available, blocked=blocked)
@@ -5583,7 +5659,7 @@ class AzooKeyLiveBridge:
         if if_fg_differs:
             raw_hook_target = getattr(self.hook, "_composing_hwnd", 0)
             hook_target = raw_hook_target if isinstance(raw_hook_target, int) and raw_hook_target else 0
-            target = hook_target or self.worker._target
+            target = hook_target or self.worker.target_hwnd
             if not target or if_fg_differs == target:
                 return False
         seq = self._hook_input_seq()
@@ -5637,7 +5713,7 @@ class AzooKeyLiveBridge:
                         hook_target = raw_hook_target if isinstance(raw_hook_target, int) and raw_hook_target else 0
                         if hook_target:
                             self._detach_hook_composing(fg, if_fg_differs=fg)
-                        elif self.worker._target and fg != self.worker._target:
+                        elif self.worker.target_hwnd and fg != self.worker.target_hwnd:
                             self._detach_hook_composing(fg)
             except (OSError, tk.TclError):
                 pass
@@ -5671,7 +5747,7 @@ class AzooKeyLiveBridge:
                     self._loaded_requested_backend = self.runtime.requested_backend
                     self.starting = False
                     self._refresh_connect_button()
-                    self.learning_count_var.set(f"学習履歴: {len(self.worker._learning_memory)} 件")
+                    self.learning_count_var.set(f"学習履歴: {self.worker.learning_count()} 件")
                     self._refresh_learning_viewer()
                     self._persist_current_settings()
                     self._set_enabled(True)
@@ -5699,7 +5775,14 @@ class AzooKeyLiveBridge:
                     self._refresh_backend_status()
                     self._show_settings_window()
                     self._refresh_status_and_indicators(force=True)
-                    messagebox.showerror("起動できません", str(value))
+                    err_msg = str(value)
+                    self.root.after_idle(
+                        lambda m=err_msg: (
+                            messagebox.showerror("起動できません", m, parent=self.root)
+                            if not self._closed
+                            else None
+                        )
+                    )
                 elif kind == "toggle":
                     if self.hook:
                         active_now = self.hook.active.is_set()
@@ -5744,7 +5827,14 @@ class AzooKeyLiveBridge:
                     self._refresh_backend_status()
                     self._show_settings_window()
                     self._refresh_status_and_indicators(force=True)
-                    messagebox.showerror("入力補助を停止しました", str(value))
+                    err_msg = str(value)
+                    self.root.after_idle(
+                        lambda m=err_msg: (
+                            messagebox.showerror("入力補助を停止しました", m, parent=self.root)
+                            if not self._closed
+                            else None
+                        )
+                    )
             if popup_hide_first:
                 self.candidate_popup.hide()
             if popup_update_pending and popup_update is not None:
@@ -5801,6 +5891,7 @@ class AzooKeyLiveBridge:
         self._cancel_path_refresh()
         self._flush_pending_zenzai_change(persist_only=True)
         self._cancel_copy_feedback()
+        self._cancel_after_attr("_learning_search_after_id")
         self._close_learning_viewer()
         self._cleanup_session(commit_pending=True)
         while True:
@@ -5813,7 +5904,7 @@ class AzooKeyLiveBridge:
                 _dispose_session(runtime, worker, hook)
         if hasattr(self, "tray_icon"):
             self.tray_icon.stop()
-        self.candidate_popup.hide()
+        self.candidate_popup.close()
         self.corner_toggle.close()
         release_mutex(self._mutex_handle)
         self._mutex_handle = None
